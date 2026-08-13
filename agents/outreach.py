@@ -200,6 +200,16 @@ Best regards,
                 msg['approved'] = True
             return messages
         
+        # Check if running in an interactive terminal
+        import sys
+        if not sys.stdin.isatty():
+            self.logger.warning(
+                "⚠️  Running in non-interactive mode. "
+                "Skipping approval gate - no messages will be sent. "
+                "Set approval.auto_approve=true in config.yaml to auto-approve in non-interactive mode."
+            )
+            return []
+        
         # CLI approval method
         if config.approval.method == 'cli':
             return self._cli_approval(messages)
