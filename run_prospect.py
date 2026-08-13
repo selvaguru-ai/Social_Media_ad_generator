@@ -22,34 +22,14 @@ from agents import AdDiscoveryAgent, ProspectAgent
 from utils import console, config
 
 
-@click.command()
-@click.argument('niche', default=None, required=False)
-@click.option(
-    '--regions',
-    default=None,
-    help='Comma-separated list of regions (e.g., US,GB,CA)'
-)
-@click.option(
-    '--max-leads',
-    default=None,
-    type=int,
-    help='Maximum number of leads to return'
-)
-@click.option(
-    '--with-ad-discovery',
-    is_flag=True,
-    help='Run Ad Discovery agent first to get competitor context'
-)
-async def run_prospect(
+async def run_prospect_async(
     niche: Optional[str],
     regions: Optional[str],
     max_leads: Optional[int],
     with_ad_discovery: bool
 ):
     """
-    Run the Prospect agent to find low-spend brand leads.
-    
-    This is the CRITICAL component - prove it works before building the rest.
+    Run the Prospect agent to find low-spend brand leads (async implementation).
     """
     console.print("\n[bold cyan]🎯 Prospect Agent - Lead Finder[/bold cyan]\n")
     
@@ -80,6 +60,38 @@ async def run_prospect(
     
     # Display results
     display_results(result, max_leads)
+
+
+@click.command()
+@click.argument('niche', default=None, required=False)
+@click.option(
+    '--regions',
+    default=None,
+    help='Comma-separated list of regions (e.g., US,GB,CA)'
+)
+@click.option(
+    '--max-leads',
+    default=None,
+    type=int,
+    help='Maximum number of leads to return'
+)
+@click.option(
+    '--with-ad-discovery',
+    is_flag=True,
+    help='Run Ad Discovery agent first to get competitor context'
+)
+def run_prospect(
+    niche: Optional[str],
+    regions: Optional[str],
+    max_leads: Optional[int],
+    with_ad_discovery: bool
+):
+    """
+    Run the Prospect agent to find low-spend brand leads.
+    
+    This is the CRITICAL component - prove it works before building the rest.
+    """
+    asyncio.run(run_prospect_async(niche, regions, max_leads, with_ad_discovery))
 
 
 def display_results(result: dict, max_leads: Optional[int] = None):
@@ -132,12 +144,5 @@ def display_results(result: dict, max_leads: Optional[int] = None):
     console.print("\n[cyan]✅ Prospect agent test complete![/cyan]\n")
 
 
-@click.command()
-def main():
-    """Wrapper to run async function."""
-    asyncio.run(run_prospect.callback())
-
-
 if __name__ == "__main__":
-    # Run with click
-    run_prospect(_anyio_backend="asyncio")
+    run_prospect()

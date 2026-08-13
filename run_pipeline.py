@@ -19,6 +19,17 @@ from orchestrator import main as run_orchestrator
 from utils import console, config
 
 
+async def run_pipeline_async(niche: str, regions: str, resume: bool):
+    """Run the full prospect-to-pitch pipeline (async implementation)."""
+    regions_list = regions.split(',') if regions else None
+    
+    await run_orchestrator(
+        niche=niche,
+        regions=regions_list,
+        resume=resume
+    )
+
+
 @click.command()
 @click.argument('niche', default=None, required=False)
 @click.option(
@@ -31,16 +42,10 @@ from utils import console, config
     is_flag=True,
     help='Resume from saved pipeline state'
 )
-async def run_pipeline(niche: str, regions: str, resume: bool):
+def run_pipeline(niche: str, regions: str, resume: bool):
     """Run the full prospect-to-pitch pipeline."""
-    regions_list = regions.split(',') if regions else None
-    
-    await run_orchestrator(
-        niche=niche,
-        regions=regions_list,
-        resume=resume
-    )
+    asyncio.run(run_pipeline_async(niche, regions, resume))
 
 
 if __name__ == "__main__":
-    run_pipeline(_anyio_backend="asyncio")
+    run_pipeline()
