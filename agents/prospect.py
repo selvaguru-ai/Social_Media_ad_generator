@@ -19,6 +19,7 @@ from urllib3.util.retry import Retry
 
 from agents.base import BaseAgent
 from utils import config, settings
+from utils.scoring import qualify_leads
 
 
 class ProspectAgent(BaseAgent):
@@ -77,14 +78,18 @@ class ProspectAgent(BaseAgent):
             # Check ad presence for each brand
             analyzed_brands = await self._analyze_ad_presence(brands, niche, regions)
             
-            # Score and qualify leads
-            leads = self._qualify_leads(
-                analyzed_brands,
-                dominant_advertisers=dominant_advertisers
+            # Score and qualify leads using the new scoring module
+            leads = qualify_leads(
+                brands=analyzed_brands,
+                dominant_advertisers=dominant_advertisers,
+                active_ads=context.get('active_ads', []),
+                weights=config.prospect.qualification_weights,
+                ideal_min_size=config.prospect.min_company_size,
+                ideal_max_size=config.prospect.max_company_size,
+                spend_is_reliable=False,  # Meta commercial ads usually don't report spend
+                spend_threshold=config.prospect.max_ad_spend_threshold,
+                gate_min_presence=0.6,  # Filter out brands with >~3 active ads
             )
-            
-            # Sort by qualification score
-            leads.sort(key=lambda x: x['qualification_score'], reverse=True)
             
             # Limit to max_leads
             leads = leads[:config.prospect.max_leads]
@@ -313,92 +318,6 @@ class ProspectAgent(BaseAgent):
                 'has_low_presence': True,
                 'error': str(e),
             }
-    
-    def _qualify_leads(
-        self,
-        brands: List[Dict[str, Any]],
-        dominant_advertisers: List[Dict[str, Any]] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Score and qualify brands as leads.
-        
-        Scoring criteria (from config.prospect.qualification_weights):
-        1. competitor_presence: Market has active advertisers (good signal)
-        2. brand_maturity: Company is established but not too large
-        3. low_ad_presence: Brand is not advertising (the key qualifier)
-        """
-        leads = []
-        weights = config.prospect.qualification_weights
-        
-        # Market competitiveness signal
-        market_has_competitors = bool(dominant_advertisers and len(dominant_advertisers) > 0)
-        
-        for brand in brands:
-            ad_presence = brand['ad_presence']
-            
-            # Only consider brands with low ad presence
-            if not ad_presence.get('has_low_presence', False):
-                continue
-            
-            # Calculate score components
-            scores = {}
-            
-            # 1. Competitor presence score (0-1)
-            scores['competitor_presence'] = 1.0 if market_has_competitors else 0.5
-            
-            # 2. Brand maturity score (0-1)
-            size = brand.get('size', 0)
-            if size >= config.prospect.min_company_size and size <= config.prospect.max_company_size:
-                scores['brand_maturity'] = 1.0
-            elif size < config.prospect.min_company_size:
-                scores['brand_maturity'] = 0.3  # Too small
-            else:
-                scores['brand_maturity'] = 0.5  # Too large
-            
-            # 3. Low ad presence score (0-1)
-            ad_count = ad_presence.get('active_ads_count', 0)
-            ad_spend = ad_presence.get('estimated_spend', 0)
-            
-            if ad_count == 0:
-                scores['low_ad_presence'] = 1.0  # No ads at all
-            elif ad_count <= 3 and ad_spend < 1000:
-                scores['low_ad_presence'] = 0.8  # Very few ads
-            else:
-                scores['low_ad_presence'] = 0.5  # Some ads but below threshold
-            
-            # Calculate weighted total
-            total_score = sum(
-                scores[key] * weights.get(key, 0)
-                for key in scores
-            )
-            
-            # Build qualification reason
-            reasons = []
-            if scores['competitor_presence'] > 0.7:
-                reasons.append("active market with competitors")
-            if scores['brand_maturity'] > 0.7:
-                reasons.append("good company size")
-            if scores['low_ad_presence'] > 0.7:
-                reasons.append("minimal ad presence")
-            
-            lead = {
-                'brand_name': brand['name'],
-                'domain': brand.get('domain'),
-                'company_size': brand.get('size'),
-                'industry': brand.get('industry'),
-                'region': brand.get('region'),
-                'ad_presence_summary': {
-                    'active_ads': ad_count,
-                    'estimated_spend': ad_spend,
-                },
-                'qualification_score': round(total_score, 3),
-                'score_breakdown': scores,
-                'qualification_reason': ', '.join(reasons),
-            }
-            
-            leads.append(lead)
-        
-        return leads
     
     def _get_session(self) -> requests.Session:
         """Create a requests session with retry logic."""
