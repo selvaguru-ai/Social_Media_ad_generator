@@ -145,7 +145,7 @@ def qualify_leads(
                            (they are clearly already advertising heavily).
 
     Returns:
-        Leads sorted by 'qualification_score' (normalized, descending).
+        Leads sorted by 'qualification_score' (raw weighted, descending).
     """
     weights = weights or {
         "competitor_presence": 0.4,
@@ -194,8 +194,9 @@ def qualify_leads(
     # Normalize competitor intensity across the batch so it actually spreads.
     comp_norm = _minmax([r["comp_raw"] for r in raw])
 
-    # Second pass: weighted score, then min-max normalize the final scores.
-    weighted: List[float] = []
+    # Second pass: weighted score (raw, in [0,1]).
+    # Do NOT min-max the final score — on clustered data a 0.048 gap becomes
+    # 1.000 vs 0.000, which is misleading. Use raw weighted scores for ranking.
     for r, cn in zip(raw, comp_norm):
         r["competitor"] = round(cn, 4)
         score = (
@@ -204,13 +205,14 @@ def qualify_leads(
             + weights["low_ad_presence"] * r["presence"]
         )
         score *= r["confidence"]  # low-confidence matches get penalized
-        r["weighted"] = score
-        weighted.append(score)
+        r["weighted"] = round(score, 4)
 
-    final_norm = _minmax(weighted)
+    # Optional: compute relative rank for context (0=worst in batch, 1=best).
+    weighted_vals = [r["weighted"] for r in raw]
+    rank_norm = _minmax(weighted_vals)
 
     leads: List[Dict[str, Any]] = []
-    for r, fn in zip(raw, final_norm):
+    for r, rn in zip(raw, rank_norm):
         brand = r["brand"]
         ap = brand.get("ad_presence", {}) or {}
         reasons = []
@@ -234,8 +236,8 @@ def qualify_leads(
                 "estimated_spend": ap.get("estimated_spend", 0),
                 "spend_reliable": spend_is_reliable,
             },
-            "qualification_score": round(fn, 4),          # normalized, for ranking
-            "raw_weighted_score": round(r["weighted"], 4),  # absolute, for debugging
+            "qualification_score": r["weighted"],  # raw weighted, for real differences
+            "relative_rank_score": round(rn, 4),   # 0=worst, 1=best in this batch
             "score_breakdown": {
                 "competitor_presence": r["competitor"],
                 "brand_maturity": r["maturity"],

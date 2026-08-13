@@ -241,13 +241,18 @@ class ProspectAgent(BaseAgent):
             self.logger.debug(f"Analyzing ad presence for {brand['name']} ({i+1}/{len(brands)})")
             
             if use_real_api:
-                ad_data = await self._check_meta_ad_library(brand['name'], regions)
+                ad_data = await self._check_meta_ad_library(
+                    brand['name'], 
+                    regions,
+                    brand_domain=brand.get('domain')
+                )
             else:
                 # Mock: randomly assign low ad presence
                 import random
                 ad_data = {
                     'active_ads_count': random.randint(0, 3),
                     'estimated_spend': random.randint(0, 1000),
+                    'match_confidence': random.choice([1.0, 1.0, 0.7]),  # Vary confidence
                     'has_low_presence': random.choice([True, True, True, False]),  # 75% low presence
                 }
             
@@ -263,21 +268,44 @@ class ProspectAgent(BaseAgent):
     async def _check_meta_ad_library(
         self,
         brand_name: str,
-        regions: List[str]
+        regions: List[str],
+        brand_domain: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Query Meta Ad Library for a specific brand.
         
-        Returns summary of their ad presence.
+        Strategy:
+        1. First try to resolve the brand's Facebook Page ID (exact match)
+        2. Query Ad Library with search_page_ids for precise footprint
+        3. Fall back to search_terms (fuzzy, unreliable) if no Page found
+        
+        Note: spend and impressions are usually NULL for commercial ads
+        (only populated for EU/DSA regulated ads and political/issue ads).
+        
+        Returns summary of their ad presence with match_confidence.
         """
         try:
+            # Step 1: Try to resolve Facebook Page ID for exact matching
+            page_id = await self._resolve_facebook_page_id(brand_name, brand_domain)
+            
             params = {
                 'access_token': self.meta_access_token,
-                'search_terms': brand_name,
                 'ad_active_status': 'ACTIVE',
                 'limit': 100,
                 'fields': 'id,impressions,spend',
             }
+            
+            match_confidence = 1.0
+            
+            if page_id:
+                # Exact match via Page ID
+                params['search_page_ids'] = page_id
+                self.logger.debug(f"Using exact Page ID match for {brand_name}: {page_id}")
+            else:
+                # Fall back to fuzzy text search (less reliable)
+                params['search_terms'] = brand_name
+                match_confidence = 0.7  # Penalize fuzzy matches in scoring
+                self.logger.debug(f"Using fuzzy text search for {brand_name} (no Page ID found)")
             
             session = self._get_session()
             response = session.get(f"{self.meta_api_base}/ads_archive", params=params)
@@ -286,7 +314,7 @@ class ProspectAgent(BaseAgent):
             data = response.json()
             ads = data.get('data', [])
             
-            # Calculate totals
+            # Calculate totals (note: usually null for commercial ads)
             total_spend = 0
             total_impressions = 0
             
@@ -303,6 +331,7 @@ class ProspectAgent(BaseAgent):
                 'active_ads_count': len(ads),
                 'estimated_spend': total_spend,
                 'total_impressions': total_impressions,
+                'match_confidence': match_confidence,
                 'has_low_presence': (
                     len(ads) < 5 and 
                     total_spend < config.prospect.max_ad_spend_threshold
@@ -315,9 +344,62 @@ class ProspectAgent(BaseAgent):
                 'active_ads_count': 0,
                 'estimated_spend': 0,
                 'total_impressions': 0,
+                'match_confidence': 1.0,
                 'has_low_presence': True,
                 'error': str(e),
             }
+    
+    async def _resolve_facebook_page_id(
+        self,
+        brand_name: str,
+        brand_domain: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Resolve a brand's Facebook Page ID for exact ad matching.
+        
+        Tries multiple strategies:
+        1. Search by brand name via Pages Search API
+        2. Look for Facebook URL in brand domain
+        
+        Returns Page ID if found, None otherwise.
+        """
+        try:
+            # Strategy 1: Use Facebook Pages Search API
+            params = {
+                'access_token': self.meta_access_token,
+                'q': brand_name,
+                'type': 'page',
+                'fields': 'id,name,link,verification_status',
+                'limit': 5,
+            }
+            
+            session = self._get_session()
+            response = session.get(f"{self.meta_api_base}/search", params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            pages = data.get('data', [])
+            
+            # Look for exact or close name match
+            for page in pages:
+                page_name = page.get('name', '').lower()
+                if brand_name.lower() in page_name or page_name in brand_name.lower():
+                    # Prefer verified pages
+                    if page.get('verification_status') == 'blue_verified':
+                        return page['id']
+                    # Otherwise take first match
+                    if not pages[0].get('id'):
+                        continue
+                    return page['id']
+            
+            # If we got any results, return the first one
+            if pages:
+                return pages[0].get('id')
+            
+        except Exception as e:
+            self.logger.debug(f"Could not resolve Facebook Page ID for {brand_name}: {e}")
+        
+        return None
     
     def _get_session(self) -> requests.Session:
         """Create a requests session with retry logic."""
