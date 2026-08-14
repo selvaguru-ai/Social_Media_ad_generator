@@ -1,0 +1,201 @@
+# Hallmark Design Skill - Frontend Development Rules
+
+## Overview
+Use the Hallmark skill for all frontend development to create beautiful, non-templated UIs that look made, not generated. The skill is located at `.agents/skills/hallmark/SKILL.md`.
+
+## When to Use Hallmark
+
+### Always Use For:
+- Building new landing pages, marketing pages, or app interfaces
+- Creating dashboard layouts and data visualization pages
+- Designing component libraries and design systems
+- Redesigning existing pages to improve visual quality
+- Auditing designs for AI-generated "slop" patterns
+
+### Use the Appropriate Verb:
+
+#### Default (Design Flow)
+For new page creation - just describe what you want to build.
+```
+Example: "Build a SaaS landing page for an AI analytics tool"
+```
+
+#### `hallmark audit <target>`
+Score existing designs against anti-pattern lists without making changes.
+```
+Example: "hallmark audit src/pages/landing.tsx"
+```
+
+#### `hallmark redesign <target> [--mood <name>]`
+Redesign the visual structure while preserving routes, content, and brand.
+```
+Example: "hallmark redesign src/pages/pricing.tsx --mood editorial"
+```
+
+#### `hallmark study <screenshot | URL>`
+Extract design DNA from reference images or live websites.
+```
+Example: "hallmark study https://example.com"
+Example: "hallmark study screenshot.png"
+```
+
+## Core Principles
+
+### 1. Structural Variety
+- Never reuse the same macrostructure (Bento Grid, Marquee Hero, etc.) across pages
+- Rotate through 21 different page structures to avoid template-like repetition
+- Each page should feel like a different site, not a color-swap
+
+### 2. Typography First
+- Most hero sections should be typography-only (no unnecessary imagery)
+- Use distinctive display + body font pairings (not single-font pages)
+- Never italicize headings - it's an AI tell
+
+### 3. Honest Copy
+- Never invent metrics, testimonials, or fake data
+- Use placeholders or ask for real content
+- No "+47% conversion" or "trusted by 50,000+ teams" unless provided
+
+### 4. Design Tokens
+- All colors use OKLCH format with CSS custom properties
+- All fonts reference named tokens (`var(--font-display)`)
+- Never inline raw hex/rgb values or font names mid-render
+
+### 5. Mobile Responsiveness
+- Verify at 320px, 375px, 414px, and 768px widths
+- No horizontal scroll (use `overflow-x: clip` on html/body)
+- All interactive text must fit on one line
+
+### 6. Interactive States
+- Design all 8 states: default, hover, focus, active, disabled, loading, error, success
+- Focus rings must be instantly visible (never animated)
+- Use optimistic updates over loading spinners
+
+## Pre-flight Protocol
+
+Before building, Hallmark will:
+1. Scan existing fonts, colors, spacing, and frameworks
+2. Preserve your design system if one exists
+3. Ask for audience, use case, and tone (or infer if you say "go ahead")
+
+## What Hallmark Produces
+
+### For Pages:
+- Complete HTML + CSS with proper semantic structure
+- `tokens.css` with all design system tokens
+- `.hallmark/log.json` tracking macrostructure history
+- Macrostructure stamp in CSS comments
+
+### For Components:
+- Single component file matching project conventions
+- 8-state demo wrapper for testing
+- Token-based styling (no inline colors)
+
+## Design System Management
+
+### Lock a Design System
+After building a page you're happy with:
+```
+"lock the system"
+```
+This creates `design.md` - a portable design system that subsequent pages will follow.
+
+### Multi-Page Projects
+If `design.md` exists, all pages share the same theme (inverted diversification).
+Without `design.md`, each page gets a different structure and theme.
+
+## Common Workflows
+
+### New SaaS Landing Page
+```
+"Build a landing page for [product] that [does X]. Audience: [who]. Use case: [action]. Tone: modern-minimal"
+```
+
+### Component Creation
+```
+"Create a button component with all 8 states following our design system"
+```
+
+### Redesign Existing Page
+```
+"hallmark redesign src/pages/about.tsx --mood editorial"
+```
+
+### Study Reference Design
+```
+"hallmark study https://stripe.com/climate"
+```
+Then: "Build with this DNA" or "Lock the DNA" to create design.md
+
+### Audit for Quality
+```
+"hallmark audit src/pages/homepage.tsx"
+```
+
+## Anti-Patterns to Avoid
+
+Hallmark automatically prevents these AI tells:
+- Fake browser chrome, phone frames, or IDE windows
+- Invented metrics and testimonials
+- Mid-render token improvisation
+- Italic display headers
+- Section tags like "01 · THE TOUR"
+- Two-column hanging headers
+- Default Specimen macrostructure overuse
+- Generic N1a nav and Ft3 footer on every page
+
+## Quality Gates
+
+Every output passes 58 slop-test gates covering:
+- Visual hierarchy and spacing
+- Typography purity
+- Color contrast (WCAG AAA preferred)
+- Interactive state coverage
+- Mobile responsiveness
+- Microinteraction discipline
+- Structural variety
+
+## Files Created by Hallmark
+
+- `.hallmark/log.json` - Diversification history
+- `.hallmark/preflight.json` - Cached project scan
+- `tokens.css` - Design system tokens
+- `design.md` - Locked design system (opt-in)
+
+## Integration with Existing Projects
+
+Hallmark respects:
+- Existing font stacks (next/font, Google Fonts, etc.)
+- Current color palettes (OKLCH, HSL, hex in :root)
+- Motion libraries (framer-motion, gsap, etc.)
+- Spacing scales (Tailwind, CSS custom properties)
+- Framework conventions (Next.js, Astro, Vue, Svelte)
+
+Never overwrites global stylesheets unless explicitly requested.
+
+## Tips for Best Results
+
+1. **Be specific about tone** - "Clean and modern" isn't a tone. Use: editorial, brutalist, soft, utilitarian, luxury, playful, technical, or austere.
+
+2. **Provide real content** - The better your copy, the better the design. Hallmark won't invent fake data.
+
+3. **Let it diversify** - Don't request the same macrostructure repeatedly. Trust the rotation.
+
+4. **Start simple** - Typography-only heroes are often stronger than image-heavy ones.
+
+5. **Review tokens** - Check `tokens.css` to see your design system values clearly.
+
+## Reference Documentation
+
+Full documentation available at:
+- `.agents/skills/hallmark/SKILL.md` - Complete skill guide
+- `.agents/skills/hallmark/references/` - All design rules and patterns
+
+## Questions Before Building
+
+Hallmark will always ask (or infer if you say "go ahead"):
+1. **Audience** - Who will use this?
+2. **Use case** - What's the one action?
+3. **Tone** - What extreme defines the aesthetic?
+
+You can skip by saying "go ahead" and Hallmark will infer and tell you what it picked.

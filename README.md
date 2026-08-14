@@ -98,6 +98,35 @@ python run_pipeline.py "sustainable fashion" --regions US,GB,CA
 
 This runs all 6 agents in sequence.
 
+### 6. Open the Dashboard
+
+The pipeline writes JSON to `data/`. The dashboard reads it and gives you a web
+approval gate instead of the CLI prompt.
+
+```bash
+pip install -r requirements-dashboard.txt
+python run_dashboard.py
+```
+
+Then open http://127.0.0.1:8000. Five views:
+
+| View | What it shows |
+| --- | --- |
+| **Overview** | Stage-by-stage funnel counts, lead-score spread, which API credentials are live |
+| **Leads** | Every qualified lead, filterable and sortable; a row opens the full score breakdown, contact record and video prompt |
+| **Market** | Dominant advertisers, active ads per region, recurring hooks — the competitor intel the pitch leans on |
+| **Approvals** | The drafted pitches, one decision at a time. Approve / reject / clear |
+| **Runs** | Report history, and a form to start or resume a run in the background |
+
+**About the approval gate.** Decisions are written to `data/approvals.json` and
+mirrored into `data/pipeline_state.json`, so a resumed orchestrator run sees the
+same approved set the dashboard shows. Approving does **not** send: SMTP delivery
+is still disabled in `agents/outreach.py`.
+
+Runs started from the dashboard shell out to `run_pipeline.py` with stdin closed,
+so the CLI approval prompt is skipped and the dashboard is the gate. One run at a
+time. The JSON API is documented at http://127.0.0.1:8000/docs.
+
 ## 📋 Build Order (Follow This!)
 
 Do NOT build everything at once. Follow this order:
@@ -120,15 +149,25 @@ See `TODO.md` for detailed task tracking.
 │   ├── contact_enrichment.py  # Contact finder
 │   ├── creative.py            # Video generation
 │   └── outreach.py            # Outreach composer (GATED)
+├── api/                       # Dashboard HTTP layer
+│   ├── main.py                # FastAPI app + routes
+│   ├── store.py               # Reads data/*.json, owns approvals.json
+│   └── runs.py                # Background pipeline launcher
+├── dashboard/                 # Dashboard front end (no build step)
+│   ├── index.html             # App shell
+│   └── assets/                # tokens.css · app.css · app.js
 ├── utils/                     # Utilities
 │   ├── config.py              # Configuration management
+│   ├── scoring.py             # Lead scoring
 │   └── logger.py              # Logging setup
 ├── orchestrator.py            # Pipeline orchestrator
 ├── run_prospect.py            # Prospect agent CLI
 ├── run_pipeline.py            # Full pipeline CLI
+├── run_dashboard.py           # Dashboard server CLI
 ├── config.yaml                # Configuration file
 ├── .env.example               # Environment template
 ├── requirements.txt           # Python dependencies
+├── requirements-dashboard.txt # Dashboard extras (FastAPI, uvicorn)
 ├── TODO.md                    # Build order tracking
 └── README.md                  # This file
 ```
@@ -159,6 +198,17 @@ python run_pipeline.py "pet food" --regions US,GB,CA,AU
 
 # Resume interrupted run
 python run_pipeline.py --resume
+```
+
+### Serve the Dashboard
+
+```bash
+# Default: http://127.0.0.1:8000
+python run_dashboard.py
+
+# Bind elsewhere, or develop with auto-reload
+python run_dashboard.py --host 0.0.0.0 --port 9000
+python run_dashboard.py --reload
 ```
 
 ## 🛡️ Compliance & Safety

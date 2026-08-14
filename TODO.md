@@ -107,7 +107,7 @@
 - [x] Message composition logic
 - [x] Human approval gate (CLI)
 - [ ] **Test SMTP sending** (keep disabled by default)
-- [ ] Add web-based approval UI
+- [x] Add web-based approval UI (`dashboard/` + `api/`, see README)
 - [ ] Add email templates
 - [ ] Implement send throttling
 - [ ] Add bounce handling
@@ -118,8 +118,15 @@
 **Current Status:**
 - Message drafting works
 - CLI approval gate implemented
+- Web approval gate implemented — decisions land in `data/approvals.json` and
+  are mirrored into `data/pipeline_state.json` so a resumed run agrees with the UI
 - SMTP sending stubbed but not tested
 - **DO NOT enable auto-send**
+
+**Remaining for the web gate:** `agents/outreach.py` still resolves approvals via
+the CLI prompt (`_cli_approval`). To let a run block on dashboard decisions, add a
+`web` branch to `_approval_gate` that polls `data/approvals.json`. Until then the
+flow is: run the pipeline, then decide in the dashboard.
 
 ---
 
@@ -204,7 +211,7 @@
 - [ ] Better business data sources (Crunchbase API)
 - [ ] Actual Higgsfield integration
 - [ ] Email verification for contacts
-- [ ] Web UI for approval gate
+- [x] Web UI for approval gate
 
 ### Medium Priority
 - [ ] A/B testing for message templates
@@ -215,7 +222,7 @@
 ### Low Priority
 - [ ] Multi-language support
 - [ ] Slack/Discord notifications
-- [ ] Analytics dashboard
+- [x] Analytics dashboard (funnel, lead scores, market intel — `dashboard/`)
 - [ ] Lead scoring ML model
 
 ---

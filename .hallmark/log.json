@@ -1,0 +1,21 @@
+[
+  {
+    "date": "2026-08-14",
+    "macrostructure": "Marquee Hero",
+    "theme": "lumen",
+    "drop": "night",
+    "nav": "N5",
+    "footer": "Ft5",
+    "enrichment": "E5 filament chamber",
+    "brief": "Operator dashboard restyle — night foundry, not a SaaS admin"
+  },
+  {
+    "date": "2026-08-13",
+    "macrostructure": "Workbench",
+    "theme": "cobalt",
+    "nav": "N3",
+    "footer": "Ft2",
+    "enrichment": "none",
+    "brief": "Operator dashboard over the prospect-to-pitch pipeline"
+  }
+]

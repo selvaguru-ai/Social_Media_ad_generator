@@ -1,0 +1,6 @@
+# Dashboard extras — the web UI for the approval gate and pipeline reporting.
+# The CLI pipeline does not need these; install only to run `run_dashboard.py`.
+-r requirements.txt
+
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
