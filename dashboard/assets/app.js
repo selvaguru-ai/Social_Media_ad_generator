@@ -19,6 +19,9 @@ const state = {
   config: null,
   overview: null,
   leads: null,
+  // Unfiltered copy so the command palette searches every lead, not just the
+  // rows the Leads table filters happen to be showing.
+  allLeads: null,
   market: null,
   messages: null,
   runs: null,
@@ -289,7 +292,7 @@ function renderOverview() {
         </section>
 
         <section class="panel">
-          <div class="panel-title tag" style="display: block; margin-block-end: var(--space-sm)">Lead scores</div>
+          <div class="tag" style="display: block; margin-block-end: var(--space-sm)">Lead scores</div>
           <div class="factlist">
             ${factRow("Average", score(data.scores.average))}
             ${factRow("Highest", score(data.scores.top))}
@@ -773,14 +776,14 @@ function renderRuns() {
           <span class="field__help">Comma-separated ISO codes.</span>
         </div>
         <div class="field">
-          <label class="field__label" for="run-submit">&nbsp;</label>
+          <span class="field__label" aria-hidden="true">&nbsp;</span>
           <button class="btn btn--primary" id="run-submit" type="submit" ${isActive ? "disabled" : ""}>
             ${icon("i-play", 15)} ${isActive ? "Run in progress" : "Start run"}
           </button>
           <span class="field__help">${isActive ? "One run at a time." : "Runs in the background."}</span>
         </div>
         <div class="field">
-          <label class="field__label" for="run-resume">&nbsp;</label>
+          <span class="field__label" aria-hidden="true">&nbsp;</span>
           <button class="btn" id="run-resume" type="button" data-action="resume-run" ${isActive ? "disabled" : ""}>
             Resume last
           </button>
@@ -1017,7 +1020,14 @@ function pollRun() {
     await loadRuns();
     if (!state.runs?.active?.active) {
       window.clearInterval(pollTimer);
-      await Promise.all([loadHealth(), loadOverview(), loadLeads(), loadMarket(), loadMessages()]);
+      await Promise.all([
+        loadHealth(),
+        loadOverview(),
+        loadLeads(),
+        loadAllLeads(),
+        loadMarket(),
+        loadMessages(),
+      ]);
       toast("Run finished. Data reloaded.");
     }
     renderView();
@@ -1027,7 +1037,8 @@ function pollRun() {
 /* ------------------------------------------------------------------ drawer */
 
 async function openLeadDrawer(leadId) {
-  const lead = (state.leads?.leads || []).find((item) => item.id === leadId);
+  const pool = [...(state.leads?.leads || []), ...(state.allLeads?.leads || [])];
+  const lead = pool.find((item) => item.id === leadId);
   if (!lead) return;
 
   const breakdown = lead.score_breakdown || {};
@@ -1110,7 +1121,7 @@ function paletteRows(query) {
     rows.push({ kind: "section", label: section.label, action: () => navigate(section.id) }),
   );
 
-  (state.leads?.leads || []).forEach((lead) =>
+  (state.allLeads?.leads || state.leads?.leads || []).forEach((lead) =>
     rows.push({
       kind: "lead",
       label: `${lead.brand_name} — score ${score(lead.qualification_score)}`,
@@ -1272,6 +1283,14 @@ async function loadLeads() {
   }
 }
 
+async function loadAllLeads() {
+  try {
+    state.allLeads = await api("/leads?sort=score&order=desc");
+  } catch {
+    state.allLeads = null;
+  }
+}
+
 async function loadMarket() {
   try {
     state.market = await api("/market");
@@ -1324,7 +1343,14 @@ window.addEventListener("hashchange", () => {
 async function boot() {
   state.section = currentSection();
   await Promise.all([loadHealth(), loadConfig()]);
-  await Promise.all([loadOverview(), loadLeads(), loadMarket(), loadMessages(), loadRuns()]);
+  await Promise.all([
+    loadOverview(),
+    loadLeads(),
+    loadAllLeads(),
+    loadMarket(),
+    loadMessages(),
+    loadRuns(),
+  ]);
   renderView();
   if (state.runs?.active?.active) pollRun();
 }

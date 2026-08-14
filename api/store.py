@@ -335,7 +335,9 @@ class PipelineStore:
             if decision.get("status") == "approved":
                 message["approved"] = True
                 approved.append(message)
-            elif decision.get("status") == "rejected":
+            else:
+                # Covers rejected and cleared alike: without a standing approval
+                # the draft must not stay flagged from an earlier decision.
                 message["approved"] = False
 
         state["approved_messages"] = approved
