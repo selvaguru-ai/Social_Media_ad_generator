@@ -3,20 +3,20 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <title>Pipeline console — prospect to pitch</title>
+    <title>pipeline console — prospect to pitch</title>
     <meta
       name="description"
       content="Review scored leads, competitor ad intel, and approve drafted outreach for the prospect-to-pitch pipeline."
     />
-    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon.svg?v=lumen-night" type="image/svg+xml" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0&family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/assets/tokens.css" />
-    <link rel="stylesheet" href="/assets/app.css" />
+    <link rel="stylesheet" href="/assets/tokens.css?v=lumen-night" />
+    <link rel="stylesheet" href="/assets/app.css?v=lumen-night" />
   </head>
   <body>
     <!-- One icon set, one stroke voice: 24px grid, 1.6 stroke, round caps. -->
@@ -135,7 +135,7 @@
             type="button"
             data-action="toggle-rail"
             aria-expanded="false"
-            aria-controls="rail"
+            aria-controls="nav-sheet"
             aria-label="Open navigation"
           >
             <svg width="16" height="16" aria-hidden="true"><use href="#i-menu" /></svg>
@@ -143,23 +143,18 @@
         </div>
       </header>
 
-      <!-- N3 side-rail. Collapses to the sheet above under 60rem. -->
-      <nav class="rail" id="rail" aria-label="Sections">
+      <!-- N5 floating pill. Content-sized, detached, solid paper — no blur. -->
+      <nav class="nav-pill" id="nav-pill" aria-label="Sections">
         <span class="wordmark"><span class="wordmark__mark">/</span>pipeline</span>
-
-        <button class="kbd-trigger" type="button" data-action="open-palette">
-          <span style="display: flex; align-items: center; gap: var(--space-xs)">
-            <svg width="15" height="15" aria-hidden="true"><use href="#i-search" /></svg>
-            Jump to…
-          </span>
+        <div class="nav-pill__links" id="rail-nav"></div>
+        <button class="kbd-chip" type="button" data-action="open-palette">
+          jump
           <kbd>⌘K</kbd>
         </button>
+      </nav>
 
-        <div class="rail__nav" id="rail-nav"></div>
-
-        <div class="rail__foot">
-          <div class="stack--tight" id="rail-status" style="display: flex; flex-direction: column"></div>
-        </div>
+      <nav class="nav-sheet" id="nav-sheet" data-open="false" aria-label="Sections">
+        <div id="sheet-nav"></div>
       </nav>
 
       <main class="main">
@@ -206,6 +201,6 @@
 
     <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
-    <script src="/assets/app.js" type="module"></script>
+    <script src="/assets/app.js?v=lumen-night" type="module"></script>
   </body>
 </html>

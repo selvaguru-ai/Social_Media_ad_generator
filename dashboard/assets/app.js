@@ -1,4 +1,4 @@
-/* Hallmark · Cobalt application console
+/* Hallmark · Lumen night foundry console
  *
  * Renders the five console views from the pipeline API. Every number displayed
  * is read from the API response; nothing is estimated or filled in client-side.
@@ -35,7 +35,7 @@ const state = {
 
 const view = document.getElementById("view");
 const railNav = document.getElementById("rail-nav");
-const railStatus = document.getElementById("rail-status");
+const sheetNav = document.getElementById("sheet-nav");
 const statusline = document.getElementById("statusline");
 const toasts = document.getElementById("toasts");
 const palette = document.getElementById("palette");
@@ -110,9 +110,15 @@ async function api(path, options = {}) {
 }
 
 /* Silent success is the default; toasts carry failures and undoable actions. */
-function toast(message, { kind = "positive", undo = null, timeout = 8000 } = {}) {
+function toast(message, { kind = "positive", undo = null, timeout = 10000, key = null } = {}) {
+  // One toast per subject: a second decision on the same draft replaces the
+  // first rather than stacking two Undo links that mean different things.
+  if (key) {
+    toasts.querySelectorAll(`[data-toast-key="${CSS.escape(key)}"]`).forEach((old) => old.remove());
+  }
   const node = document.createElement("div");
   node.className = `toast toast--${kind}`;
+  if (key) node.dataset.toastKey = key;
   node.innerHTML = `
     ${icon(kind === "critical" ? "i-alert" : "i-check", 16)}
     <span>${esc(message)}</span>
@@ -174,15 +180,15 @@ function statusChip(status) {
   return `<span class="chip${kind ? ` chip--${kind}` : ""}">${icon(glyph, 12)}${esc(label)}</span>`;
 }
 
-function meter(label, value, muted = false) {
+function gauge(label, value, muted = false) {
   const width = value === null || value === undefined ? 0 : Math.max(0, Math.min(1, value)) * 100;
   return `
-    <div class="meter">
-      <span class="meter__label">${esc(label)}</span>
-      <span class="meter__track">
-        <span class="meter__fill${muted ? " meter__fill--muted" : ""}" style="width: ${width}%"></span>
+    <div class="gauge">
+      <span class="gauge__label">${esc(label)}</span>
+      <span class="gauge__track">
+        <span class="gauge__fill${muted ? " gauge__fill--muted" : ""}" style="width: ${width}%"></span>
       </span>
-      <span class="meter__value">${score(value)}</span>
+      <span class="gauge__value">${score(value)}</span>
     </div>
   `;
 }
@@ -197,6 +203,73 @@ function factRow(key, value) {
 }
 
 /* -------------------------------------------------------------------- views */
+
+function spectrumFromScores(leads) {
+  const scores = (leads || [])
+    .map((lead) => lead.qualification_score)
+    .filter((value) => typeof value === "number")
+    .sort((a, b) => a - b);
+  if (scores.length < 2) return "";
+
+  const bars = 64;
+  const lo = Math.min(...scores);
+  const hi = Math.max(...scores);
+  const ticks = [];
+  for (let i = 0; i < bars; i += 1) {
+    const t = scores.length === 1 ? 0 : (i / (bars - 1)) * (scores.length - 1);
+    const i0 = Math.floor(t);
+    const i1 = Math.min(scores.length - 1, i0 + 1);
+    const frac = t - i0;
+    const value = scores[i0] * (1 - frac) + scores[i1] * frac;
+    const norm = hi === lo ? 0.5 : (value - lo) / (hi - lo);
+    const height = 18 + Math.round(norm * 82);
+    const opacity = 0.28 + norm * 0.72;
+    ticks.push(`<span style="height:${height}%;--o:${opacity.toFixed(2)}"></span>`);
+  }
+
+  return `
+    <aside class="spectrum" aria-label="Lead score envelope">
+      <p class="spectrum__label spectrum__label--left">low · ${score(lo)}</p>
+      <div class="spectrum__bars">${ticks.join("")}</div>
+      <p class="spectrum__label spectrum__label--right">high · ${score(hi)}</p>
+    </aside>
+  `;
+}
+
+function apparatus(totals, scores) {
+  const callouts = [
+    totals.leads != null ? { side: "left", y: "18%", text: `qualified · ${num(totals.leads)}` } : null,
+    scores.average != null ? { side: "right", y: "36%", text: `avg score · ${score(scores.average)}` } : null,
+    totals.awaiting_decision != null
+      ? { side: "left", y: "62%", text: `awaiting · ${num(totals.awaiting_decision)}` }
+      : null,
+    totals.brands_analyzed != null
+      ? { side: "right", y: "80%", text: `analysed · ${num(totals.brands_analyzed)}` }
+      : null,
+  ].filter(Boolean);
+
+  return `
+    <figure class="apparatus" aria-hidden="true">
+      <div class="chamber">
+        <span class="chamber__electrode" style="--y: 22%"></span>
+        <span class="chamber__electrode" style="--y: 42%"></span>
+        <span class="chamber__electrode" style="--y: 62%"></span>
+        <span class="chamber__electrode" style="--y: 82%"></span>
+        <span class="chamber__filament"></span>
+        <span class="chamber__glow"></span>
+        <span class="chamber__stencil">rx-04</span>
+      </div>
+      <ul class="callouts">
+        ${callouts
+          .map(
+            (item) =>
+              `<li class="callout callout--${item.side}" style="--y: ${item.y}"><span>${esc(item.text)}</span></li>`,
+          )
+          .join("")}
+      </ul>
+    </figure>
+  `;
+}
 
 function renderOverview() {
   const data = state.overview;
@@ -248,32 +321,64 @@ function renderOverview() {
           ${icon("i-alert", 18)}
           <div class="banner__body">
             <strong>${num(t.awaiting_decision)} draft${t.awaiting_decision === 1 ? "" : "s"} awaiting your decision.</strong>
-            Nothing sends until you approve it.
-            <a href="#approvals" style="color: var(--color-accent); text-decoration: underline; text-underline-offset: 2px">Open the approval queue</a>.
+            nothing sends until you approve it.
+            <a href="#approvals">open the approval queue</a>.
           </div>
         </div>
       `
       : "";
 
-  return `
-    <div class="page-head enter">
-      <span class="tag">Run ${esc(data.run_id)} · ${esc(data.status || "unknown")}</span>
-      <h1>${esc(data.niche || "Untitled niche")}</h1>
-      <p class="lede">
-        ${esc((data.regions || []).join(" · ") || "No regions recorded")} —
-        started ${esc(when(data.started_at))}${data.completed_at ? `, finished ${esc(when(data.completed_at))}` : ""}.
-      </p>
-    </div>
+  const canStats = t.leads != null && t.awaiting_decision != null && data.scores.average != null;
 
-    ${data.error ? `<div class="banner banner--critical">${icon("i-alert", 18)}<div class="banner__body"><strong>Run failed.</strong> ${esc(data.error)}</div></div>` : ""}
+  return `
+    <section class="hero enter">
+      <div class="hero__copy">
+        <span class="eyebrow">00 · ${esc(data.run_id)} · ${esc(data.status || "unknown")}</span>
+        <h1>quiet brands. loud market. ready to&nbsp;<em class="verb">pitch</em>.</h1>
+        <p class="lede">
+          ${esc(data.niche || "untitled niche")} · ${esc((data.regions || []).join(" · ") || "no regions")} —
+          started ${esc(when(data.started_at))}${data.completed_at ? `, finished ${esc(when(data.completed_at))}` : ""}.
+        </p>
+      </div>
+      ${apparatus(t, data.scores)}
+    </section>
+
+    ${spectrumFromScores(state.allLeads?.leads || state.leads?.leads)}
+
+    ${
+      canStats
+        ? `<div class="statrow">
+            <div class="stat">
+              <span class="stat__label">qualified</span>
+              <span class="stat__value">${num(t.leads)}</span>
+              <span class="stat__note">${num(t.pitch_ready)} pitch-ready</span>
+            </div>
+            <div class="stat">
+              <span class="stat__label">awaiting</span>
+              <span class="stat__value">${num(t.awaiting_decision)}</span>
+              <span class="stat__note">${num(t.drafted)} drafted · sending off</span>
+            </div>
+            <div class="stat">
+              <span class="stat__label">avg score</span>
+              <span class="stat__value">${score(data.scores.average)}</span>
+              <span class="stat__note">${score(data.scores.low)} – ${score(data.scores.top)}</span>
+            </div>
+          </div>`
+        : ""
+    }
+
+    ${data.error ? `<div class="banner banner--critical">${icon("i-alert", 18)}<div class="banner__body"><strong>run failed.</strong> ${esc(data.error)}</div></div>` : ""}
     ${waiting}
     ${mockBanner(state.health?.integrations)}
 
     <div class="split">
       <section class="panel--flush panel">
         <div class="panel__head">
-          <h2 style="font-size: var(--text-md)">Pipeline funnel</h2>
-          <span class="tag">stage · reached / eligible</span>
+          <div>
+            <span class="eyebrow" style="display:block;margin-block-end:var(--space-2xs)">01 · funnel</span>
+            <h2>stage by stage</h2>
+          </div>
+          <span class="tag">reached / eligible</span>
         </div>
         <div class="panel__body">
           <ol class="funnel">${funnel}</ol>
@@ -282,39 +387,19 @@ function renderOverview() {
 
       <div class="stack">
         <section class="panel">
-          <div class="readout">
-            <span class="tag">Qualified leads</span>
-            <span class="readout__value">${num(t.leads)}</span>
-            <span class="readout__note">
-              ${num(t.pitch_ready)} pitch-ready · ${num(t.contactable)} with a named contact
-            </span>
-          </div>
-        </section>
-
-        <section class="panel">
-          <div class="tag" style="display: block; margin-block-end: var(--space-sm)">Lead scores</div>
-          <div class="factlist">
-            ${factRow("Average", score(data.scores.average))}
-            ${factRow("Highest", score(data.scores.top))}
-            ${factRow("Lowest", score(data.scores.low))}
-            ${factRow("Brands analysed", num(t.brands_analyzed))}
-            ${factRow("Competitor ads found", num(t.active_ads))}
-          </div>
-        </section>
-
-        <section class="panel">
-          <div class="tag" style="display: block; margin-block-end: var(--space-sm)">Outreach</div>
+          <span class="eyebrow" style="display:block;margin-block-end:var(--space-sm)">02 · outreach</span>
           <div class="factlist">
             ${factRow("Drafted", num(t.drafted))}
-            ${factRow("Awaiting decision", num(t.awaiting_decision))}
             ${factRow("Approved", num(t.approved))}
             ${factRow("Rejected", num(t.rejected))}
             ${factRow("Sent", num(t.sent))}
+            ${factRow("Brands analysed", num(t.brands_analyzed))}
+            ${factRow("Competitor ads", num(t.active_ads))}
           </div>
         </section>
 
         <section class="panel">
-          <div class="tag" style="display: block; margin-block-end: var(--space-sm)">Data sources</div>
+          <span class="eyebrow" style="display:block;margin-block-end:var(--space-sm)">03 · sources</span>
           <div class="factlist">${integrations}</div>
         </section>
       </div>
@@ -395,11 +480,11 @@ function renderLeads() {
 
   return `
     <div class="page-head enter">
-      <span class="tag">Prospect stage output</span>
-      <h1>Qualified leads</h1>
+      <span class="eyebrow">01 · prospect</span>
+      <h1>every score is a reason to&nbsp;<em class="verb">reach</em>.</h1>
       <p class="lede">
-        Brands with little or no ad footprint in a market where competitors are spending.
-        Ranked by the weighted score the prospect agent wrote${weightLine ? `: ${esc(weightLine)}` : ""}.
+        brands with little or no ad footprint in a market where competitors are spending.
+        ranked by the weighted score the prospect agent wrote${weightLine ? `: ${esc(weightLine)}` : ""}.
       </p>
     </div>
 
@@ -485,12 +570,12 @@ function renderMarket() {
     .sort((a, b) => b[1] - a[1])
     .map(
       ([region, count]) => `
-        <div class="meter">
-          <span class="meter__label mono">${esc(region)}</span>
-          <span class="meter__track">
-            <span class="meter__fill" style="width: ${(count / maxRegion) * 100}%"></span>
+        <div class="gauge">
+          <span class="gauge__label">${esc(region)}</span>
+          <span class="gauge__track">
+            <span class="gauge__fill" style="width: ${(count / maxRegion) * 100}%"></span>
           </span>
-          <span class="meter__value">${num(count)}</span>
+          <span class="gauge__value">${num(count)}</span>
         </div>
       `,
     )
@@ -504,10 +589,10 @@ function renderMarket() {
 
   return `
     <div class="page-head enter">
-      <span class="tag">Ad discovery stage output</span>
-      <h1>Market activity</h1>
+      <span class="eyebrow">02 · ad discovery</span>
+      <h1>who is already&nbsp;<em class="verb">running</em> ads.</h1>
       <p class="lede">
-        Who is already advertising in ${esc(data.niche || "this niche")}. This is the intel the pitch
+        who is already advertising in ${esc(data.niche || "this niche")}. this is the intel the pitch
         leans on — a lead is worth contacting because these brands are spending and they are not.
       </p>
     </div>
@@ -580,8 +665,9 @@ function renderApprovals() {
   if (!messages.length) {
     return `
       <div class="page-head enter">
-        <span class="tag">Outreach stage output</span>
-        <h1>Approval queue</h1>
+        <span class="eyebrow">03 · outreach</span>
+        <h1>nothing sends until you&nbsp;<em class="verb">decide</em>.</h1>
+        <p class="lede">every pitch needs an explicit decision. nothing is waiting in this run.</p>
       </div>
       <section class="panel">
         ${emptyState(
@@ -630,10 +716,10 @@ function renderApprovals() {
 
   return `
     <div class="page-head enter">
-      <span class="tag">Outreach stage output</span>
-      <h1>Approval queue</h1>
+      <span class="eyebrow">03 · outreach</span>
+      <h1>nothing sends until you&nbsp;<em class="verb">decide</em>.</h1>
       <p class="lede">
-        Every pitch needs an explicit decision before the pipeline will send it.
+        every pitch needs an explicit decision before the pipeline will send it.
         ${num(pending)} of ${num(messages.length)} still awaiting yours.
       </p>
     </div>
@@ -743,10 +829,10 @@ function renderRuns() {
 
   return `
     <div class="page-head enter">
-      <span class="tag">Orchestrator</span>
-      <h1>Runs</h1>
+      <span class="eyebrow">04 · orchestrator</span>
+      <h1>start a run. watch it&nbsp;<em class="verb">write</em>.</h1>
       <p class="lede">
-        Each run writes a report to <code>data/</code>. Starting a run here shells out to the same
+        each run writes a report to <code>data/</code>. starting a run here shells out to the same
         CLI entry point, with stdin closed so the terminal approval prompt is skipped — this console
         is the gate instead.
       </p>
@@ -835,6 +921,25 @@ const RENDERERS = {
 
 /* ----------------------------------------------------------------- chrome */
 
+function navLinks(counts) {
+  return SECTIONS.map(
+    (section) => `
+      <a
+        class="nav-pill__link"
+        href="#${section.id}"
+        ${state.section === section.id ? 'aria-current="page"' : ""}
+      >
+        <span>${esc(section.label)}</span>
+        ${
+          counts[section.id] !== undefined && counts[section.id] !== null
+            ? `<span class="nav-pill__count">${num(counts[section.id])}</span>`
+            : ""
+        }
+      </a>
+    `,
+  ).join("");
+}
+
 function renderRail() {
   const counts = {
     leads: state.overview?.totals?.leads,
@@ -843,51 +948,21 @@ function renderRail() {
     runs: (state.runs?.runs || []).length || undefined,
   };
 
-  railNav.innerHTML = SECTIONS.map(
-    (section) => `
-      <a
-        class="rail__link"
-        href="#${section.id}"
-        ${state.section === section.id ? 'aria-current="page"' : ""}
-      >
-        ${icon(section.icon, 17)}
-        <span>${esc(section.label)}</span>
-        ${
-          counts[section.id] !== undefined && counts[section.id] !== null
-            ? `<span class="rail__count">${num(counts[section.id])}</span>`
-            : ""
-        }
-      </a>
-    `,
-  ).join("");
-
-  const health = state.health;
-  railStatus.innerHTML = `
-    <span class="tag">Environment</span>
-    <span class="table__sub">
-      ${
-        health
-          ? health.mock_mode
-            ? "All sources mocked"
-            : `${health.integrations.filter((item) => item.configured).length}/${health.integrations.length} sources live`
-          : "checking…"
-      }
-    </span>
-    <span class="table__sub mono">${esc(state.config?.market?.niche || "")}</span>
-  `;
+  const links = navLinks(counts);
+  railNav.innerHTML = links;
+  if (sheetNav) sheetNav.innerHTML = links;
 
   const send = state.overview?.summaries?.send;
-  statusline.innerHTML = [
-    `run ${esc(state.overview?.run_id || "—")}`,
-    `<span class="statusline__dot">·</span>`,
-    `${num(state.overview?.totals?.leads)} leads`,
-    `<span class="statusline__dot">·</span>`,
-    `${num(send?.total_drafted)} drafted`,
-    `<span class="statusline__dot">·</span>`,
-    `${num(state.overview?.totals?.approved)} approved`,
-    `<span class="statusline__dot">·</span>`,
-    `sending disabled in outreach agent`,
-  ].join(" ");
+  statusline.innerHTML = `
+    <span>the market is already spending. these brands are not.</span>
+    <span class="mono">
+      ${esc(state.overview?.run_id || "—")}
+      · ${num(state.overview?.totals?.leads)} leads
+      · ${num(send?.total_drafted)} drafted
+      · ${num(state.overview?.totals?.approved)} approved
+      · sending off
+    </span>
+  `;
 }
 
 function renderView() {
@@ -969,34 +1044,59 @@ function bindViewEvents() {
   }
 }
 
-async function decide(button, messageId, status) {
-  const previous = (state.messages?.messages || []).find((message) => message.id === messageId);
-  button.setAttribute("aria-busy", "true");
-  try {
-    await api(`/messages/${encodeURIComponent(messageId)}/decision`, {
-      method: "POST",
-      body: JSON.stringify({ status, run_id: state.messages.run_id }),
-    });
-    await Promise.all([loadMessages(), loadOverview()]);
-    renderView();
+/** Serialises decision writes so a slow response can't overwrite a newer one. */
+let decisionChain = Promise.resolve();
 
-    if (status !== "pending" && previous && previous.status !== status) {
-      toast(`${messageId} marked ${status}.`, {
-        kind: status === "rejected" ? "critical" : "positive",
-        undo: async () => {
-          await api(`/messages/${encodeURIComponent(messageId)}/decision`, {
-            method: "POST",
-            body: JSON.stringify({ status: previous.status, run_id: state.messages.run_id }),
-          });
-          await Promise.all([loadMessages(), loadOverview()]);
-          renderView();
-        },
-      });
-    }
-  } catch (error) {
-    button.removeAttribute("aria-busy");
-    toast(error.message, { kind: "critical" });
-  }
+function currentStatusOf(messageId) {
+  const message = (state.messages?.messages || []).find((item) => item.id === messageId);
+  return message ? message.status : null;
+}
+
+async function applyDecision(messageId, status) {
+  await api(`/messages/${encodeURIComponent(messageId)}/decision`, {
+    method: "POST",
+    body: JSON.stringify({ status, run_id: state.messages?.run_id }),
+  });
+  await Promise.all([loadMessages(), loadOverview()]);
+  renderView();
+  return currentStatusOf(messageId);
+}
+
+function decide(button, messageId, status) {
+  // Status is read as a primitive before the write, so undo can't be confused by
+  // the message objects being replaced when the queue reloads.
+  const previousStatus = currentStatusOf(messageId) || "pending";
+  button.setAttribute("aria-busy", "true");
+
+  decisionChain = decisionChain
+    .then(async () => {
+      try {
+        const settled = await applyDecision(messageId, status);
+        if (status === "pending" || previousStatus === status) return;
+
+        toast(`${messageId} marked ${settled || status}.`, {
+          kind: status === "rejected" ? "critical" : "positive",
+          key: messageId,
+          undo: () => {
+            decisionChain = decisionChain
+              .then(async () => {
+                const reverted = await applyDecision(messageId, previousStatus);
+                if (reverted !== previousStatus) {
+                  toast(
+                    `Could not restore ${messageId} to ${previousStatus} — it is now ${reverted}.`,
+                    { kind: "critical" },
+                  );
+                }
+              })
+              .catch((error) => toast(`Undo failed: ${error.message}`, { kind: "critical" }));
+          },
+        });
+      } catch (error) {
+        button.removeAttribute("aria-busy");
+        toast(error.message, { kind: "critical" });
+      }
+    })
+    .catch((error) => toast(error.message, { kind: "critical" }));
 }
 
 async function startRun(button, payload) {
@@ -1059,10 +1159,10 @@ async function openLeadDrawer(leadId) {
         Score ${score(lead.qualification_score)} · rank ${score(lead.relative_rank_score)} in batch
       </div>
       <div class="stack--tight" style="display: flex; flex-direction: column">
-        ${meter("Competitor presence", breakdown.competitor_presence)}
-        ${meter("Brand maturity", breakdown.brand_maturity)}
-        ${meter("Low ad presence", breakdown.low_ad_presence)}
-        ${meter("Match confidence", breakdown.match_confidence, true)}
+        ${gauge("Competitor presence", breakdown.competitor_presence)}
+        ${gauge("Brand maturity", breakdown.brand_maturity)}
+        ${gauge("Low ad presence", breakdown.low_ad_presence)}
+        ${gauge("Match confidence", breakdown.match_confidence, true)}
       </div>
     </section>
 
@@ -1234,11 +1334,9 @@ document.addEventListener("click", (event) => {
   if (action === "open-palette") openPalette();
 
   if (action === "toggle-rail") {
-    const rail = document.getElementById("rail");
-    const open = rail.dataset.open !== "true";
-    rail.dataset.open = String(open);
-    trigger.setAttribute("aria-expanded", String(open));
-    trigger.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+    const sheet = document.getElementById("nav-sheet");
+    const open = sheet?.dataset.open !== "true";
+    setNavSheetOpen(open);
   }
 
   if (action === "close-drawer") drawer.close();
@@ -1331,11 +1429,19 @@ function navigate(sectionId) {
   window.location.hash = `#${sectionId}`;
 }
 
+function setNavSheetOpen(open) {
+  const sheet = document.getElementById("nav-sheet");
+  if (sheet) sheet.dataset.open = String(open);
+  const toggle = document.querySelector('[data-action="toggle-rail"]');
+  if (toggle) {
+    toggle.setAttribute("aria-expanded", String(open));
+    toggle.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+  }
+}
+
 window.addEventListener("hashchange", () => {
   state.section = currentSection();
-  document.getElementById("rail").dataset.open = "false";
-  const toggle = document.querySelector('[data-action="toggle-rail"]');
-  if (toggle) toggle.setAttribute("aria-expanded", "false");
+  setNavSheetOpen(false);
   renderView();
   window.scrollTo({ top: 0 });
 });
