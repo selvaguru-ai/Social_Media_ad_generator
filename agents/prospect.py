@@ -438,9 +438,16 @@ class ProspectAgent(BaseAgent):
                 continue
             present = True
             if isinstance(value, dict):
-                total += int(value.get('lower_bound') or 0)
-            elif isinstance(value, (int, float)):
-                total += int(value)
+                bound = value.get('lower_bound') or 0
+                try:
+                    total += int(float(bound))
+                except (TypeError, ValueError):
+                    pass
+            elif isinstance(value, (int, float, str)):
+                try:
+                    total += int(float(value))
+                except (TypeError, ValueError):
+                    pass
         return total, present
     
     @staticmethod

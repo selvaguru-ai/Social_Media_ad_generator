@@ -108,7 +108,7 @@ class AdDiscoveryAgent(BaseAgent):
         """
         all_ads = []
         
-        for region in regions:
+        for i, region in enumerate(regions):
             self.logger.info(f"Fetching ads for '{niche}' in {region}")
             
             params = {
@@ -140,21 +140,37 @@ class AdDiscoveryAgent(BaseAgent):
                 with_page = sum(1 for ad in ads if ad.get('page_name'))
                 with_spend = sum(1 for ad in ads if ad.get('spend'))
                 with_impressions = sum(1 for ad in ads if ad.get('impressions'))
+                with_snapshot = sum(1 for ad in ads if ad.get('ad_snapshot_url'))
                 self.logger.info(
                     f"[REAL Meta API] '{niche}' in {region}: {len(ads)} ads | "
                     f"page_name on {with_page}/{len(ads)} | "
                     f"spend on {with_spend}/{len(ads)} | "
-                    f"impressions on {with_impressions}/{len(ads)}"
+                    f"impressions on {with_impressions}/{len(ads)} | "
+                    f"snapshot_url on {with_snapshot}/{len(ads)}"
                 )
+                for ad in ads:
+                    self.logger.info(
+                        f"  Ad {ad.get('id')} | {ad.get('page_name')}: "
+                        f"{self._public_ad_link(ad)}"
+                    )
                 
-                # Rate limiting
-                await asyncio.sleep(self.rate_limit_delay)
+                # Rate limiting between regions only (skip after the last one)
+                if i < len(regions) - 1:
+                    await asyncio.sleep(self.rate_limit_delay)
                 
             except requests.exceptions.RequestException as e:
                 self.logger.error(f"Failed to fetch ads for {region}: {e}")
                 continue
         
         return all_ads
+
+    @staticmethod
+    def _public_ad_link(ad: Dict[str, Any]) -> str:
+        """Public Ad Library URL. Never log ad_snapshot_url — it embeds the access token."""
+        ad_id = ad.get('id')
+        if ad_id:
+            return f"https://www.facebook.com/ads/library/?id={ad_id}"
+        return '(no ad id)'
     
     def _get_session(self) -> requests.Session:
         """Create a requests session with retry logic."""
@@ -169,6 +185,16 @@ class AdDiscoveryAgent(BaseAgent):
         session.mount("https://", adapter)
         return session
     
+    @staticmethod
+    def _as_int(value: Any, default: int = 0) -> int:
+        """Coerce Meta range bounds (often numeric strings) to int."""
+        if value in (None, ""):
+            return default
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
     def _identify_dominant_advertisers(self, ads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Identify advertisers with the most active ads."""
         advertiser_counts = {}
@@ -186,18 +212,22 @@ class AdDiscoveryAgent(BaseAgent):
             advertiser_counts[page_name]['ad_count'] += 1
             
             # spend/impressions are usually absent for commercial ads — never
-            # assume a missing field is a dict.
+            # assume a missing field is a dict. Meta returns bounds as strings.
             impressions = ad.get('impressions')
             if isinstance(impressions, dict):
-                advertiser_counts[page_name]['total_impressions'] += impressions.get('lower_bound') or 0
-            elif isinstance(impressions, (int, float)):
-                advertiser_counts[page_name]['total_impressions'] += impressions
+                advertiser_counts[page_name]['total_impressions'] += self._as_int(
+                    impressions.get('lower_bound')
+                )
+            elif isinstance(impressions, (int, float, str)):
+                advertiser_counts[page_name]['total_impressions'] += self._as_int(impressions)
             
             spend = ad.get('spend')
             if isinstance(spend, dict):
-                advertiser_counts[page_name]['estimated_spend'] += spend.get('lower_bound') or 0
-            elif isinstance(spend, (int, float)):
-                advertiser_counts[page_name]['estimated_spend'] += spend
+                advertiser_counts[page_name]['estimated_spend'] += self._as_int(
+                    spend.get('lower_bound')
+                )
+            elif isinstance(spend, (int, float, str)):
+                advertiser_counts[page_name]['estimated_spend'] += self._as_int(spend)
         
         # Sort by ad count
         sorted_advertisers = sorted(

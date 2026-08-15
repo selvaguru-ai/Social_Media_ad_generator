@@ -92,7 +92,11 @@ def _region_competitor_intensity(
     for ad in active_ads or []:
         region = ad.get("target_region") or ad.get("region") or "UNKNOWN"
         impressions = ad.get("impressions") or {}
-        imp = impressions.get("lower_bound", 0) if isinstance(impressions, dict) else 0
+        raw_imp = impressions.get("lower_bound", 0) if isinstance(impressions, dict) else 0
+        try:
+            imp = float(raw_imp or 0)
+        except (TypeError, ValueError):
+            imp = 0.0
         # Each ad contributes 1 unit + an impressions bonus (log-damped).
         intensity[region] = intensity.get(region, 0.0) + 1.0 + (imp / 100_000.0)
 

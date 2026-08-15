@@ -8,8 +8,6 @@ market:
   # Target region(s) for ad discovery (ISO country codes)
   regions:
     - "US"
-    - "GB"
-    - "CA"
   
   # Optional: Seed brands to start discovery from
   seed_brands:
@@ -19,7 +17,7 @@ market:
 # Ad Discovery agent settings
 ad_discovery:
   # Number of ads to fetch per query
-  ads_per_query: 100
+  ads_per_query: 10
   
   # Minimum impressions threshold (if available)
   min_impressions: 100
