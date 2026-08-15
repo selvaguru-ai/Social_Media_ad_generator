@@ -16,6 +16,14 @@ from urllib3.util.retry import Retry
 from agents.base import BaseAgent
 from utils import config, settings
 
+# Same commercial-ad field set as the Prospect agent. spend/impressions are
+# usually absent for non-EU commercial ads; page_name is the advertiser identity.
+COMMERCIAL_AD_FIELDS = (
+    "id,page_id,page_name,ad_delivery_start_time,ad_delivery_stop_time,"
+    "ad_snapshot_url,publisher_platforms,ad_creative_bodies,"
+    "ad_creative_link_titles,impressions,spend"
+)
+
 
 class AdDiscoveryAgent(BaseAgent):
     """
@@ -55,11 +63,18 @@ class AdDiscoveryAgent(BaseAgent):
             regions = context.get('regions') or config.market.regions
             
             # Check if API credentials are available
-            if not self.access_token or self.access_token == "your_meta_access_token_here":
+            token = (self.access_token or "").strip()
+            if not token or token.startswith("your_"):
                 self.logger.warning(
-                    "⚠️  Meta API credentials not configured. Using MOCK data."
+                    "⚠️  Meta API credentials not configured (META_ACCESS_TOKEN "
+                    "missing or placeholder). Using MOCK data."
                 )
                 return self._mock_response(niche, regions)
+            
+            self.logger.info(
+                "Using REAL Meta Ad Library API for market discovery "
+                "(META_ACCESS_TOKEN is set)"
+            )
             
             # Fetch ads from Meta Ad Library
             ads = await self._fetch_ads(niche, regions)
@@ -102,7 +117,8 @@ class AdDiscoveryAgent(BaseAgent):
                 'ad_reached_countries': region,
                 'ad_active_status': 'ACTIVE',
                 'limit': config.ad_discovery.ads_per_query,
-                'fields': 'id,ad_creative_bodies,ad_creative_link_titles,ad_delivery_start_time,impressions,spend,page_name',
+                # Explicit fields are required; the default payload is nearly empty.
+                'fields': COMMERCIAL_AD_FIELDS,
             }
             
             try:
@@ -121,7 +137,15 @@ class AdDiscoveryAgent(BaseAgent):
                 
                 all_ads.extend(ads)
                 
-                self.logger.info(f"Retrieved {len(ads)} ads from {region}")
+                with_page = sum(1 for ad in ads if ad.get('page_name'))
+                with_spend = sum(1 for ad in ads if ad.get('spend'))
+                with_impressions = sum(1 for ad in ads if ad.get('impressions'))
+                self.logger.info(
+                    f"[REAL Meta API] '{niche}' in {region}: {len(ads)} ads | "
+                    f"page_name on {with_page}/{len(ads)} | "
+                    f"spend on {with_spend}/{len(ads)} | "
+                    f"impressions on {with_impressions}/{len(ads)}"
+                )
                 
                 # Rate limiting
                 await asyncio.sleep(self.rate_limit_delay)
@@ -150,7 +174,7 @@ class AdDiscoveryAgent(BaseAgent):
         advertiser_counts = {}
         
         for ad in ads:
-            page_name = ad.get('page_name', 'Unknown')
+            page_name = ad.get('page_name') or 'Unknown'
             if page_name not in advertiser_counts:
                 advertiser_counts[page_name] = {
                     'name': page_name,
@@ -161,16 +185,19 @@ class AdDiscoveryAgent(BaseAgent):
             
             advertiser_counts[page_name]['ad_count'] += 1
             
-            # Parse impressions if available
-            impressions = ad.get('impressions', {})
+            # spend/impressions are usually absent for commercial ads — never
+            # assume a missing field is a dict.
+            impressions = ad.get('impressions')
             if isinstance(impressions, dict):
-                # Lower bound of impression range
-                advertiser_counts[page_name]['total_impressions'] += impressions.get('lower_bound', 0)
+                advertiser_counts[page_name]['total_impressions'] += impressions.get('lower_bound') or 0
+            elif isinstance(impressions, (int, float)):
+                advertiser_counts[page_name]['total_impressions'] += impressions
             
-            # Parse spend if available
-            spend = ad.get('spend', {})
+            spend = ad.get('spend')
             if isinstance(spend, dict):
-                advertiser_counts[page_name]['estimated_spend'] += spend.get('lower_bound', 0)
+                advertiser_counts[page_name]['estimated_spend'] += spend.get('lower_bound') or 0
+            elif isinstance(spend, (int, float)):
+                advertiser_counts[page_name]['estimated_spend'] += spend
         
         # Sort by ad count
         sorted_advertisers = sorted(

@@ -10,6 +10,8 @@ Approach:
 3. Surface brands with low/no ad footprint but strong business fundamentals
 """
 import asyncio
+import json
+import re
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 
@@ -20,6 +22,26 @@ from urllib3.util.retry import Retry
 from agents.base import BaseAgent
 from utils import config, settings
 from utils.scoring import qualify_leads
+
+# Commercial-ad fields that the Ad Library actually returns without extra
+# permissions. spend and impressions are usually ABSENT for non-EU commercial
+# ads; they are requested only so EU/DSA responses can be used when present.
+COMMERCIAL_AD_FIELDS = (
+    "id,page_id,page_name,ad_delivery_start_time,ad_delivery_stop_time,"
+    "ad_snapshot_url,publisher_platforms,impressions,spend"
+)
+
+_PLACEHOLDER_TOKENS = {
+    None,
+    "",
+    "your_meta_access_token_here",
+}
+
+_COMPANY_SUFFIXES = re.compile(
+    r"\b(inc|incorporated|llc|ltd|limited|co|corp|corporation|company|"
+    r"studio|lab|labs|collective|house|group|brands?)\b",
+    re.IGNORECASE,
+)
 
 
 class ProspectAgent(BaseAgent):
@@ -46,6 +68,11 @@ class ProspectAgent(BaseAgent):
         self.apollo_api_key = settings.apollo_api_key
         self.meta_access_token = settings.meta_access_token
         self.meta_api_base = "https://graph.facebook.com/v18.0"
+
+    def _meta_api_configured(self) -> bool:
+        """True when a real (non-placeholder) Meta access token is set."""
+        token = (self.meta_access_token or "").strip()
+        return token not in _PLACEHOLDER_TOKENS and not token.startswith("your_")
     
     async def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -223,43 +250,54 @@ class ProspectAgent(BaseAgent):
         
         For each brand, query the Ad Library to see:
         - How many active ads they have
-        - Estimated spend (if available)
-        - Impression counts
+        - Estimated spend (if available — usually not, for commercial ads)
+        - Impression counts (if available — usually not, for commercial ads)
         """
         analyzed = []
+        use_real_api = self._meta_api_configured()
         
-        # Check if Meta API is configured
-        use_real_api = (
-            self.meta_access_token and 
-            self.meta_access_token != "your_meta_access_token_here"
-        )
-        
-        if not use_real_api:
-            self.logger.warning("⚠️  Meta API not configured. Using MOCK ad presence data.")
+        if use_real_api:
+            self.logger.info(
+                "Using REAL Meta Ad Library API for ad-presence checks "
+                "(META_ACCESS_TOKEN is set)"
+            )
+        else:
+            self.logger.warning(
+                "⚠️  Meta API not configured (META_ACCESS_TOKEN missing or placeholder). "
+                "Using MOCK ad presence data."
+            )
         
         for i, brand in enumerate(brands):
-            self.logger.debug(f"Analyzing ad presence for {brand['name']} ({i+1}/{len(brands)})")
+            self.logger.debug(
+                f"Analyzing ad presence for {brand['name']} ({i+1}/{len(brands)})"
+            )
             
             if use_real_api:
                 ad_data = await self._check_meta_ad_library(
-                    brand['name'], 
+                    brand['name'],
                     regions,
                     brand_domain=brand.get('domain')
                 )
             else:
-                # Mock: randomly assign low ad presence
                 import random
                 ad_data = {
                     'active_ads_count': random.randint(0, 3),
                     'estimated_spend': random.randint(0, 1000),
-                    'match_confidence': random.choice([1.0, 1.0, 0.7]),  # Vary confidence
-                    'has_low_presence': random.choice([True, True, True, False]),  # 75% low presence
+                    'match_confidence': random.choice([1.0, 1.0, 0.7]),
+                    'has_low_presence': random.choice([True, True, True, False]),
+                    'source': 'mock',
+                    'spend_present': True,
+                    'impressions_present': True,
+                    'page_name': None,
                 }
+                self.logger.info(
+                    f"[MOCK] {brand['name']}: {ad_data['active_ads_count']} ads "
+                    f"(synthetic data — not from Meta)"
+                )
             
             brand['ad_presence'] = ad_data
             analyzed.append(brand)
             
-            # Rate limiting for real API
             if use_real_api:
                 await asyncio.sleep(3600 / config.ad_discovery.max_requests_per_hour)
         
@@ -277,77 +315,187 @@ class ProspectAgent(BaseAgent):
         Strategy:
         1. First try to resolve the brand's Facebook Page ID (exact match)
         2. Query Ad Library with search_page_ids for precise footprint
-        3. Fall back to search_terms (fuzzy, unreliable) if no Page found
+        3. Fall back to search_terms (fuzzy) if no Page found
+        4. Re-score match_confidence from returned page_name vs brand name
         
-        Note: spend and impressions are usually NULL for commercial ads
-        (only populated for EU/DSA regulated ads and political/issue ads).
+        Note: spend and impressions are usually NULL for commercial (non-EU)
+        ads. Presence is judged on active-ad COUNT, not spend. Advertiser
+        identity comes from page_name.
         
-        Returns summary of their ad presence with match_confidence.
+        The default ads_archive response is nearly empty without an explicit
+        `fields` parameter — always request COMMERCIAL_AD_FIELDS.
         """
         try:
-            # Step 1: Try to resolve Facebook Page ID for exact matching
             page_id = await self._resolve_facebook_page_id(brand_name, brand_domain)
             
             params = {
                 'access_token': self.meta_access_token,
                 'ad_active_status': 'ACTIVE',
                 'limit': 100,
-                'fields': 'id,impressions,spend',
+                # Explicit fields are required; the default payload is nearly empty.
+                'fields': COMMERCIAL_AD_FIELDS,
             }
+            if regions:
+                # ads_archive requires ad_reached_countries.
+                params['ad_reached_countries'] = json.dumps(regions)
             
-            match_confidence = 1.0
-            
+            lookup = 'search_page_ids'
             if page_id:
-                # Exact match via Page ID
-                params['search_page_ids'] = page_id
-                self.logger.debug(f"Using exact Page ID match for {brand_name}: {page_id}")
+                params['search_page_ids'] = json.dumps([str(page_id)])
+                self.logger.debug(
+                    f"Using exact Page ID match for {brand_name}: {page_id}"
+                )
             else:
-                # Fall back to fuzzy text search (less reliable)
                 params['search_terms'] = brand_name
-                match_confidence = 0.7  # Penalize fuzzy matches in scoring
-                self.logger.debug(f"Using fuzzy text search for {brand_name} (no Page ID found)")
+                lookup = 'search_terms'
+                self.logger.debug(
+                    f"Using fuzzy text search for {brand_name} (no Page ID found)"
+                )
             
             session = self._get_session()
             response = session.get(f"{self.meta_api_base}/ads_archive", params=params)
             response.raise_for_status()
             
             data = response.json()
-            ads = data.get('data', [])
+            ads = data.get('data') or []
             
-            # Calculate totals (note: usually null for commercial ads)
-            total_spend = 0
-            total_impressions = 0
+            total_spend, spend_present = self._sum_optional_range(ads, 'spend')
+            total_impressions, impressions_present = self._sum_optional_range(
+                ads, 'impressions'
+            )
             
-            for ad in ads:
-                spend = ad.get('spend', {})
-                if isinstance(spend, dict):
-                    total_spend += spend.get('lower_bound', 0)
-                
-                impressions = ad.get('impressions', {})
-                if isinstance(impressions, dict):
-                    total_impressions += impressions.get('lower_bound', 0)
+            page_names = [
+                ad.get('page_name') for ad in ads if ad.get('page_name')
+            ]
+            unique_page_names = sorted(set(page_names))
+            primary_page_name = unique_page_names[0] if unique_page_names else None
+            
+            match_confidence = self._match_confidence_from_page_names(
+                brand_name,
+                unique_page_names,
+                used_page_id=bool(page_id),
+            )
+            
+            # Presence is ad-count based. Do not treat missing spend as $0 spend.
+            has_low_presence = len(ads) < 5
+            if spend_present:
+                has_low_presence = (
+                    has_low_presence
+                    and total_spend < config.prospect.max_ad_spend_threshold
+                )
+            
+            self.logger.info(
+                f"[REAL Meta API] {brand_name}: {len(ads)} ads | "
+                f"page_name={'present (' + ', '.join(unique_page_names[:3]) + ')' if unique_page_names else 'absent'} | "
+                f"spend={'present' if spend_present else 'absent'} | "
+                f"impressions={'present' if impressions_present else 'absent'} | "
+                f"lookup={lookup} | "
+                f"match_confidence={match_confidence:.2f}"
+            )
             
             return {
                 'active_ads_count': len(ads),
-                'estimated_spend': total_spend,
-                'total_impressions': total_impressions,
+                'estimated_spend': total_spend if spend_present else 0,
+                'total_impressions': total_impressions if impressions_present else 0,
+                'spend_present': spend_present,
+                'impressions_present': impressions_present,
+                'page_name': primary_page_name,
+                'page_names': unique_page_names,
+                'page_id': page_id,
                 'match_confidence': match_confidence,
-                'has_low_presence': (
-                    len(ads) < 5 and 
-                    total_spend < config.prospect.max_ad_spend_threshold
-                ),
+                'has_low_presence': has_low_presence,
+                'source': 'meta_api',
             }
             
         except Exception as e:
-            self.logger.error(f"Error checking ad library for {brand_name}: {e}")
+            self.logger.error(f"[REAL Meta API] Error checking ad library for {brand_name}: {e}")
             return {
                 'active_ads_count': 0,
                 'estimated_spend': 0,
                 'total_impressions': 0,
+                'spend_present': False,
+                'impressions_present': False,
+                'page_name': None,
                 'match_confidence': 1.0,
                 'has_low_presence': True,
+                'source': 'meta_api_error',
                 'error': str(e),
             }
+    
+    @staticmethod
+    def _sum_optional_range(ads: List[Dict[str, Any]], field: str) -> tuple:
+        """
+        Sum a Meta range field like spend/impressions without crashing when
+        the field is missing, null, or not a dict (typical for commercial ads).
+        
+        Returns (total, was_present).
+        """
+        total = 0
+        present = False
+        for ad in ads:
+            value = ad.get(field)
+            if value in (None, "", {}, []):
+                continue
+            present = True
+            if isinstance(value, dict):
+                total += int(value.get('lower_bound') or 0)
+            elif isinstance(value, (int, float)):
+                total += int(value)
+        return total, present
+    
+    @staticmethod
+    def _normalize_brand_name(name: str) -> str:
+        """Lowercase, strip punctuation and common company suffixes."""
+        if not name:
+            return ""
+        cleaned = name.lower()
+        cleaned = re.sub(r"https?://(www\.)?", "", cleaned)
+        cleaned = re.sub(r"[^a-z0-9\s]", " ", cleaned)
+        cleaned = _COMPANY_SUFFIXES.sub("", cleaned)
+        return " ".join(cleaned.split())
+    
+    def _name_similarity(self, brand_name: str, page_name: str) -> float:
+        """Cheap token-overlap similarity in [0, 1] for brand vs page_name."""
+        a = self._normalize_brand_name(brand_name)
+        b = self._normalize_brand_name(page_name)
+        if not a or not b:
+            return 0.0
+        if a == b:
+            return 1.0
+        if a in b or b in a:
+            return 0.9
+        a_tokens = set(a.split())
+        b_tokens = set(b.split())
+        if not a_tokens or not b_tokens:
+            return 0.0
+        overlap = len(a_tokens & b_tokens)
+        return overlap / max(len(a_tokens), len(b_tokens))
+    
+    def _match_confidence_from_page_names(
+        self,
+        brand_name: str,
+        page_names: List[str],
+        used_page_id: bool,
+    ) -> float:
+        """
+        Use returned page_name to strengthen (or penalize) the brand match.
+        
+        High confidence when page_name closely matches the target brand.
+        Below 1.0 when it doesn't, so scoring down-weights the lead.
+        """
+        if not page_names:
+            # No ads (or no page_name on the payload). Page-ID lookup is still
+            # a reasonably exact empty-footprint signal; text search is not.
+            return 0.9 if used_page_id else 0.6
+        
+        best = max(self._name_similarity(brand_name, pn) for pn in page_names)
+        if best >= 0.85:
+            return 1.0
+        if best >= 0.6:
+            return 0.85
+        if used_page_id:
+            return 0.7
+        return 0.5
     
     async def _resolve_facebook_page_id(
         self,
