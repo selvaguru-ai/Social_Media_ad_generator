@@ -172,6 +172,8 @@ def qualify_leads(
         count = int(ap.get("active_ads_count", 0) or 0)
         spend = float(ap.get("estimated_spend", 0) or 0)
         confidence = float(ap.get("match_confidence", 1.0) or 1.0)
+        if ap.get("page_unresolved"):
+            continue  # unknown footprint, not a confirmed low-spend lead
 
         p = presence_score(count, spend, spend_is_reliable, spend_threshold)
         if p < gate_min_presence:
@@ -239,6 +241,8 @@ def qualify_leads(
                 "active_ads": ap.get("active_ads_count", 0),
                 "estimated_spend": ap.get("estimated_spend", 0),
                 "spend_reliable": spend_is_reliable,
+                "library_url": ap.get("library_url"),
+                "page_id": ap.get("page_id"),
             },
             "qualification_score": r["weighted"],  # raw weighted, for real differences
             "relative_rank_score": round(rn, 4),   # 0=worst, 1=best in this batch

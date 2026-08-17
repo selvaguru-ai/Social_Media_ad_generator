@@ -181,14 +181,14 @@ class ProspectAgent(BaseAgent):
         headers = {
             'Content-Type': 'application/json',
             'Cache-Control': 'no-cache',
+            'X-Api-Key': self.apollo_api_key,
         }
         
         for region in regions:
             payload = {
-                'api_key': self.apollo_api_key,
                 'q_organization_keyword_tags': [niche],
                 'page': 1,
-                'per_page': 50,
+                'per_page': 10,
                 'organization_locations': [region],
                 'organization_num_employees_ranges': [
                     f"{config.prospect.min_company_size}-{config.prospect.max_company_size}"
@@ -202,20 +202,32 @@ class ProspectAgent(BaseAgent):
                     headers=headers,
                     json=payload
                 )
+                if not response.ok:
+                    self.logger.error(
+                        f"Apollo API error for {region}: {response.status_code} "
+                        f"{response.text[:500]}"
+                    )
+                    continue
                 response.raise_for_status()
                 
                 data = response.json()
                 companies = data.get('organizations', [])
                 
                 for company in companies:
+                    website = company.get('website_url') or company.get('primary_domain')
                     brands.append({
                         'name': company.get('name'),
-                        'domain': company.get('website_url'),
+                        'domain': website,
+                        'facebook_url': company.get('facebook_url'),
+                        'linkedin_url': company.get('linkedin_url'),
                         'size': company.get('estimated_num_employees'),
-                        'industry': company.get('industry'),
+                        'industry': company.get('industry') or niche,
                         'region': region,
                         'source': 'apollo',
                     })
+                    self.logger.info(
+                        f"  Apollo: {company.get('name')} | {website or '(no website)'}"
+                    )
                 
                 self.logger.info(f"Fetched {len(companies)} companies from Apollo for {region}")
                 
@@ -276,7 +288,8 @@ class ProspectAgent(BaseAgent):
                 ad_data = await self._check_meta_ad_library(
                     brand['name'],
                     regions,
-                    brand_domain=brand.get('domain')
+                    brand_domain=brand.get('domain'),
+                    facebook_url=brand.get('facebook_url'),
                 )
             else:
                 import random
@@ -307,92 +320,94 @@ class ProspectAgent(BaseAgent):
         self,
         brand_name: str,
         regions: List[str],
-        brand_domain: Optional[str] = None
+        brand_domain: Optional[str] = None,
+        facebook_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Query Meta Ad Library for a specific brand.
-        
-        Strategy:
-        1. First try to resolve the brand's Facebook Page ID (exact match)
-        2. Query Ad Library with search_page_ids for precise footprint
-        3. Fall back to search_terms (fuzzy) if no Page found
-        4. Re-score match_confidence from returned page_name vs brand name
-        
-        Note: spend and impressions are usually NULL for commercial (non-EU)
-        ads. Presence is judged on active-ad COUNT, not spend. Advertiser
-        identity comes from page_name.
-        
-        The default ads_archive response is nearly empty without an explicit
-        `fields` parameter — always request COMMERCIAL_AD_FIELDS.
+        Query Meta Ad Library for a specific brand by Facebook Page ID.
+
+        Keyword search_terms is NOT used for presence — it matches unrelated
+        ads (romance/drama pages) and both inflates and zeros counts wrongly.
         """
         try:
-            page_id = await self._resolve_facebook_page_id(brand_name, brand_domain)
-            
+            page_id = await self._resolve_facebook_page_id(
+                brand_name, brand_domain, facebook_url
+            )
+            library_url = self._ad_library_page_url(page_id, regions)
+
+            if not page_id:
+                self.logger.info(
+                    f"[REAL Meta API] {brand_name}: page unresolved | "
+                    f"facebook_url={facebook_url or 'absent'} | "
+                    f"lookup=unresolved | match_confidence=0.20 "
+                    f"(not treated as 0 ads)"
+                )
+                return {
+                    'active_ads_count': 0,
+                    'estimated_spend': 0,
+                    'total_impressions': 0,
+                    'spend_present': False,
+                    'impressions_present': False,
+                    'page_name': None,
+                    'page_names': [],
+                    'page_id': None,
+                    'match_confidence': 0.2,
+                    'has_low_presence': False,
+                    'page_unresolved': True,
+                    'library_url': facebook_url,
+                    'source': 'meta_api',
+                    'lookup': 'unresolved',
+                }
+
             params = {
                 'access_token': self.meta_access_token,
-                'ad_active_status': 'ACTIVE',
+                'search_page_ids': json.dumps([str(page_id)]),
+                # ACTIVE alone often returns 0 for commercial pages the UI
+                # still shows; ALL is the footprint that matches Ad Library.
+                'ad_active_status': 'ALL',
                 'limit': 100,
-                # Explicit fields are required; the default payload is nearly empty.
                 'fields': COMMERCIAL_AD_FIELDS,
             }
             if regions:
-                # ads_archive requires ad_reached_countries.
                 params['ad_reached_countries'] = json.dumps(regions)
-            
-            lookup = 'search_page_ids'
-            if page_id:
-                params['search_page_ids'] = json.dumps([str(page_id)])
-                self.logger.debug(
-                    f"Using exact Page ID match for {brand_name}: {page_id}"
-                )
-            else:
-                params['search_terms'] = brand_name
-                lookup = 'search_terms'
-                self.logger.debug(
-                    f"Using fuzzy text search for {brand_name} (no Page ID found)"
-                )
-            
+
             session = self._get_session()
             response = session.get(f"{self.meta_api_base}/ads_archive", params=params)
             response.raise_for_status()
-            
+
             data = response.json()
             ads = data.get('data') or []
-            
+
             total_spend, spend_present = self._sum_optional_range(ads, 'spend')
             total_impressions, impressions_present = self._sum_optional_range(
                 ads, 'impressions'
             )
-            
+
             page_names = [
                 ad.get('page_name') for ad in ads if ad.get('page_name')
             ]
             unique_page_names = sorted(set(page_names))
             primary_page_name = unique_page_names[0] if unique_page_names else None
-            
-            match_confidence = self._match_confidence_from_page_names(
-                brand_name,
-                unique_page_names,
-                used_page_id=bool(page_id),
-            )
-            
-            # Presence is ad-count based. Do not treat missing spend as $0 spend.
+
+            match_confidence = 1.0 if ads else 0.85
+
             has_low_presence = len(ads) < 5
             if spend_present:
                 has_low_presence = (
                     has_low_presence
                     and total_spend < config.prospect.max_ad_spend_threshold
                 )
-            
+
             self.logger.info(
                 f"[REAL Meta API] {brand_name}: {len(ads)} ads | "
+                f"page_id={page_id} | "
                 f"page_name={'present (' + ', '.join(unique_page_names[:3]) + ')' if unique_page_names else 'absent'} | "
-                f"spend={'present' if spend_present else 'absent'} | "
-                f"impressions={'present' if impressions_present else 'absent'} | "
-                f"lookup={lookup} | "
+                f"lookup=search_page_ids | "
                 f"match_confidence={match_confidence:.2f}"
             )
-            
+            if library_url:
+                self.logger.info(f"  Ad Library: {library_url}")
+
             return {
                 'active_ads_count': len(ads),
                 'estimated_spend': total_spend if spend_present else 0,
@@ -404,11 +419,17 @@ class ProspectAgent(BaseAgent):
                 'page_id': page_id,
                 'match_confidence': match_confidence,
                 'has_low_presence': has_low_presence,
+                'page_unresolved': False,
+                'library_url': library_url,
                 'source': 'meta_api',
+                'lookup': 'search_page_ids',
             }
-            
+
         except Exception as e:
-            self.logger.error(f"[REAL Meta API] Error checking ad library for {brand_name}: {e}")
+            safe = re.sub(r"access_token=[^&\s]+", "access_token=REDACTED", str(e))
+            self.logger.error(
+                f"[REAL Meta API] Error checking ad library for {brand_name}: {safe}"
+            )
             return {
                 'active_ads_count': 0,
                 'estimated_spend': 0,
@@ -416,10 +437,12 @@ class ProspectAgent(BaseAgent):
                 'spend_present': False,
                 'impressions_present': False,
                 'page_name': None,
-                'match_confidence': 1.0,
-                'has_low_presence': True,
+                'match_confidence': 0.2,
+                'has_low_presence': False,
+                'page_unresolved': True,
+                'library_url': facebook_url,
                 'source': 'meta_api_error',
-                'error': str(e),
+                'error': re.sub(r"access_token=[^&\s]+", "access_token=REDACTED", str(e)),
             }
     
     @staticmethod
@@ -507,54 +530,125 @@ class ProspectAgent(BaseAgent):
     async def _resolve_facebook_page_id(
         self,
         brand_name: str,
-        brand_domain: Optional[str] = None
+        brand_domain: Optional[str] = None,
+        facebook_url: Optional[str] = None,
     ) -> Optional[str]:
         """
-        Resolve a brand's Facebook Page ID for exact ad matching.
-        
-        Tries multiple strategies:
-        1. Search by brand name via Pages Search API
-        2. Look for Facebook URL in brand domain
-        
-        Returns Page ID if found, None otherwise.
+        Resolve a brand's Facebook Page ID for ads_archive search_page_ids.
+
+        Graph Pages Search is usually empty without extra app review. Prefer
+        Apollo's facebook_url, then try to extract a numeric page id.
         """
+        for candidate in (facebook_url, brand_domain):
+            page_id = self._page_id_from_facebook_url(candidate)
+            if page_id and self._ads_archive_accepts_page_id(page_id, ["US"]):
+                return page_id
+
+        if facebook_url:
+            page_id = self._page_id_from_facebook_html(facebook_url)
+            if page_id and self._ads_archive_accepts_page_id(page_id, ["US"]):
+                return page_id
+
         try:
-            # Strategy 1: Use Facebook Pages Search API
             params = {
                 'access_token': self.meta_access_token,
                 'q': brand_name,
                 'type': 'page',
-                'fields': 'id,name,link,verification_status',
+                'fields': 'id,name,link',
                 'limit': 5,
             }
-            
             session = self._get_session()
             response = session.get(f"{self.meta_api_base}/search", params=params)
             response.raise_for_status()
-            
-            data = response.json()
-            pages = data.get('data', [])
-            
-            # Look for exact or close name match
+            pages = response.json().get('data') or []
+            brand_l = (brand_name or "").lower()
             for page in pages:
-                page_name = page.get('name', '').lower()
-                if brand_name.lower() in page_name or page_name in brand_name.lower():
-                    # Prefer verified pages
-                    if page.get('verification_status') == 'blue_verified':
-                        return page['id']
-                    # Otherwise take first match
-                    if not pages[0].get('id'):
-                        continue
-                    return page['id']
-            
-            # If we got any results, return the first one
+                page_name = (page.get('name') or "").lower()
+                if brand_l and (brand_l in page_name or page_name in brand_l):
+                    return str(page['id'])
             if pages:
-                return pages[0].get('id')
-            
+                return str(pages[0].get('id') or "") or None
         except Exception as e:
             self.logger.debug(f"Could not resolve Facebook Page ID for {brand_name}: {e}")
-        
+
         return None
+
+    @staticmethod
+    def _page_id_from_facebook_url(url: Optional[str]) -> Optional[str]:
+        if not url:
+            return None
+        patterns = [
+            r'view_all_page_id=(\d{5,})',
+            r'profile\.php\?id=(\d{5,})',
+            r'/pages/[^/]+/(\d{5,})',
+            r'facebook\.com/(?:profile\.php\?id=)?(\d{5,})\b',
+        ]
+        for pat in patterns:
+            match = re.search(pat, url)
+            if match:
+                return match.group(1)
+        return None
+
+    def _ads_archive_accepts_page_id(
+        self, page_id: str, regions: Optional[List[str]] = None
+    ) -> bool:
+        """True when ads_archive will query this page id (rejects new-style IDs)."""
+        try:
+            params = {
+                "access_token": self.meta_access_token,
+                "search_page_ids": json.dumps([str(page_id)]),
+                "ad_reached_countries": json.dumps(regions or ["US"]),
+                "ad_active_status": "ALL",
+                "fields": "id,page_name",
+                "limit": 1,
+            }
+            response = self._get_session().get(
+                f"{self.meta_api_base}/ads_archive", params=params, timeout=20
+            )
+            if response.status_code == 400:
+                return False
+            response.raise_for_status()
+            return True
+        except Exception:
+            return False
+
+    def _page_id_from_facebook_html(self, facebook_url: str) -> Optional[str]:
+        """Best-effort page id from a public Facebook URL (vanity pages)."""
+        try:
+            session = self._get_session()
+            response = session.get(
+                facebook_url,
+                timeout=8,
+                headers={'User-Agent': 'Mozilla/5.0'},
+                allow_redirects=True,
+            )
+            html = response.text or ""
+        except Exception as e:
+            self.logger.debug(f"Facebook page fetch failed for {facebook_url}: {e}")
+            return None
+        for pat in (
+            r'"pageID":"(\d{5,})"',
+            r'"page_id":"?(\d{5,})"?',
+            r'fb://page/(\d{5,})',
+            r'fb://profile/(\d{5,})',
+        ):
+            match = re.search(pat, html)
+            if match:
+                return match.group(1)
+        return None
+
+    @staticmethod
+    def _ad_library_page_url(page_id: Optional[str], regions: List[str]) -> Optional[str]:
+        if not page_id:
+            return None
+        country = (regions[0] if regions else "US")
+        return (
+            "https://www.facebook.com/ads/library/"
+            f"?active_status=active&ad_type=all&country={country}"
+            "&is_targeted_country=false&media_type=all&search_type=page"
+            "&sort_data[direction]=desc&sort_data[mode]=total_impressions"
+            f"&view_all_page_id={page_id}"
+        )
     
     def _get_session(self) -> requests.Session:
         """Create a requests session with retry logic."""

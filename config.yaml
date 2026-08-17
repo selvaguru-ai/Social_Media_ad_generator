@@ -4,11 +4,11 @@
 market:
   # The niche/industry to target (e.g., "sustainable fashion", "pet food", "fitness apps")
   niche: "sustainable fashion"
-  
+
   # Target region(s) for ad discovery (ISO country codes)
   regions:
     - "US"
-  
+
   # Optional: Seed brands to start discovery from
   seed_brands:
     - "patagonia"
@@ -16,15 +16,23 @@ market:
 
 # Ad Discovery agent settings
 ad_discovery:
-  # Number of ads to fetch per query
-  ads_per_query: 10
-  
+  # Number of ads to fetch per Meta page
+  ads_per_query: 20
+  # Stop once this many on-niche ads are kept (pagination may fetch more)
+  max_kept_ads: 10
+
+  # LLM relevance filter — keeps ads genuinely about the niche
+  niche_filter:
+    provider: anthropic # or "openai"
+    model: claude-sonnet-4-6
+    enabled: true
+
   # Minimum impressions threshold (if available)
   min_impressions: 100
-  
+
   # Days to look back (where supported)
   lookback_days: 90
-  
+
   # Rate limiting (Meta Ad Library: ~200 calls/hour)
   max_requests_per_hour: 180
   backoff_seconds: 3
@@ -33,15 +41,15 @@ ad_discovery:
 prospect:
   # Maximum number of leads to generate per run
   max_leads: 50
-  
+
   # Minimum company size (employees)
   min_company_size: 10
   max_company_size: 500
-  
+
   # Ad spend thresholds
   # Brands spending less than this are considered "low-spend" leads
-  max_ad_spend_threshold: 5000  # USD per month
-  
+  max_ad_spend_threshold: 5000 # USD per month
+
   # Qualification criteria weights
   qualification_weights:
     competitor_presence: 0.4
@@ -57,49 +65,49 @@ contact_enrichment:
     - "CMO"
     - "Marketing Director"
     - "Growth Lead"
-  
+
   # Minimum confidence score (0-1) to include a contact
   min_confidence: 0.7
-  
+
   # Rate limiting
   max_requests_per_minute: 60
 
 # Creative agent (Higgsfield) settings
 creative:
   # Video generation parameters
-  video_duration: 15  # seconds
+  video_duration: 15 # seconds
   video_format: "mp4"
   video_resolution: "1080p"
-  
+
   # Generation timeout
   generation_timeout_seconds: 300
-  
+
   # Polling interval for async jobs
   poll_interval_seconds: 10
   max_poll_attempts: 30
-  
+
   # Default video style/theme
   default_style: "modern and professional"
-  
+
   # Rate limiting (adjust based on your plan)
   max_concurrent_generations: 3
 
 # Outreach agent settings
 outreach:
   # Message template settings
-  personalization_level: "high"  # high, medium, low
-  
+  personalization_level: "high" # high, medium, low
+
   # Send throttling (to avoid spam filters)
   max_sends_per_day: 50
   min_seconds_between_sends: 60
-  
+
   # Regional compliance
   compliance:
     # US: CAN-SPAM compliant
     us_contacts:
       require_unsubscribe_link: true
       require_physical_address: true
-    
+
     # EU/UK: GDPR/ePrivacy compliant
     eu_contacts:
       require_explicit_consent: true
@@ -110,21 +118,21 @@ orchestrator:
   # Maximum retries per agent
   max_retries: 3
   retry_backoff_seconds: 5
-  
+
   # State persistence
   state_file: "data/pipeline_state.json"
-  
+
   # Logging
-  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  log_level: "INFO" # DEBUG, INFO, WARNING, ERROR
   log_file: "pipeline.log"
 
 # Human approval gate
 approval:
   # Require human approval before sending any outreach
   enabled: true
-  
+
   # Approval method
-  method: "cli"  # cli, web, email
-  
+  method: "cli" # cli, web, email
+
   # Auto-approve for testing (DANGEROUS - keep false in production)
   auto_approve: false

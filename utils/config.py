@@ -28,13 +28,22 @@ class MarketConfig(BaseModel):
     seed_brands: List[str] = Field(default_factory=list)
 
 
+class NicheFilterConfig(BaseModel):
+    """LLM relevance filter for Ad Discovery."""
+    provider: str = "anthropic"
+    model: str = "claude-sonnet-4-6"
+    enabled: bool = True
+
+
 class AdDiscoveryConfig(BaseModel):
     """Ad discovery agent configuration."""
     ads_per_query: int = 100
+    max_kept_ads: int = 10
     min_impressions: int = 100
     lookback_days: int = 90
     max_requests_per_hour: int = 180
     backoff_seconds: int = 3
+    niche_filter: NicheFilterConfig = Field(default_factory=NicheFilterConfig)
 
 
 class ProspectConfig(BaseModel):
@@ -131,6 +140,10 @@ class Settings(BaseSettings):
     
     # Optional
     crunchbase_api_key: Optional[str] = None
+
+    # LLM niche filter (Ad Discovery)
+    anthropic_api_key: Optional[str] = None
+    openai_api_key: Optional[str] = None
     
     class Config:
         env_file = ".env"

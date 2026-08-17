@@ -111,6 +111,7 @@ def display_results(result: dict, max_leads: Optional[int] = None):
     table = Table(show_header=True, header_style="bold cyan")
     table.add_column("#", style="dim", width=3)
     table.add_column("Brand Name", style="bold")
+    table.add_column("Website")
     table.add_column("Size", justify="right")
     table.add_column("Industry")
     table.add_column("Region", justify="center")
@@ -124,7 +125,8 @@ def display_results(result: dict, max_leads: Optional[int] = None):
         table.add_row(
             str(i),
             lead['brand_name'],
-            str(lead.get('company_size', 'N/A')),
+            lead.get('domain') or '—',
+            str(lead.get('company_size') or 'N/A'),
             lead.get('industry', 'N/A'),
             lead.get('region', 'N/A'),
             f"{lead['qualification_score']:.3f}",
@@ -133,6 +135,12 @@ def display_results(result: dict, max_leads: Optional[int] = None):
         )
     
     console.print(table)
+
+    console.print("\n[bold]Verify in Ad Library:[/bold]")
+    for lead in leads:
+        url = (lead.get("ad_presence_summary") or {}).get("library_url") or lead.get("domain")
+        if url:
+            console.print(f"  {lead['brand_name']}: {url}")
     
     # Summary stats
     console.print(f"\n[bold]Summary:[/bold]")

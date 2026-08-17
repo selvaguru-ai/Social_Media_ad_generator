@@ -5,7 +5,10 @@ Discovers what ads are currently running in the target niche using the Meta Ad L
 Identifies dominant advertisers and recurring ad patterns.
 """
 import asyncio
-from typing import Any, Dict, List, Optional
+import json
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 
 import aiohttp
@@ -23,6 +26,10 @@ COMMERCIAL_AD_FIELDS = (
     "ad_snapshot_url,publisher_platforms,ad_creative_bodies,"
     "ad_creative_link_titles,impressions,spend"
 )
+
+# Hard cap on Meta paging to stay under ~200 calls/hour.
+MAX_META_PAGES = 3
+_PLACEHOLDER_KEY_PREFIX = "your_"
 
 
 class AdDiscoveryAgent(BaseAgent):
@@ -42,6 +49,7 @@ class AdDiscoveryAgent(BaseAgent):
         self.api_base = "https://graph.facebook.com/v18.0"
         self.access_token = settings.meta_access_token
         self.rate_limit_delay = 3600 / config.ad_discovery.max_requests_per_hour
+        self._llm_skip_logged = False
     
     async def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -101,68 +109,302 @@ class AdDiscoveryAgent(BaseAgent):
     
     async def _fetch_ads(self, niche: str, regions: List[str]) -> List[Dict[str, Any]]:
         """
-        Fetch ads from Meta Ad Library API.
-        
-        API endpoint: /ads_archive
-        Docs: https://developers.facebook.com/docs/marketing-api/reference/ads-archive/
+        Fetch ads from Meta Ad Library API, paginate, then keep on-niche ads.
+
+        Follows paging.next until max_kept_ads is reached or MAX_META_PAGES
+        pages have been fetched. Each page is classified by an LLM (one call
+        per page); falls back to a simple niche-word check if the LLM is
+        unavailable.
         """
-        all_ads = []
-        
+        all_ads: List[Dict[str, Any]] = []
+        max_kept = getattr(config.ad_discovery, "max_kept_ads", 10) or 10
+
         for i, region in enumerate(regions):
             self.logger.info(f"Fetching ads for '{niche}' in {region}")
-            
-            params = {
-                'access_token': self.access_token,
-                'search_terms': niche,
-                'ad_reached_countries': region,
-                'ad_active_status': 'ACTIVE',
-                'limit': config.ad_discovery.ads_per_query,
-                # Explicit fields are required; the default payload is nearly empty.
-                'fields': COMMERCIAL_AD_FIELDS,
-            }
-            
+
             try:
-                # Use requests with retry logic
-                session = self._get_session()
-                response = session.get(f"{self.api_base}/ads_archive", params=params)
-                response.raise_for_status()
-                
-                data = response.json()
-                ads = data.get('data', [])
-                
-                # Enrich with region
-                for ad in ads:
-                    ad['target_region'] = region
-                    ad['niche'] = niche
-                
-                all_ads.extend(ads)
-                
-                with_page = sum(1 for ad in ads if ad.get('page_name'))
-                with_spend = sum(1 for ad in ads if ad.get('spend'))
-                with_impressions = sum(1 for ad in ads if ad.get('impressions'))
-                with_snapshot = sum(1 for ad in ads if ad.get('ad_snapshot_url'))
-                self.logger.info(
-                    f"[REAL Meta API] '{niche}' in {region}: {len(ads)} ads | "
-                    f"page_name on {with_page}/{len(ads)} | "
-                    f"spend on {with_spend}/{len(ads)} | "
-                    f"impressions on {with_impressions}/{len(ads)} | "
-                    f"snapshot_url on {with_snapshot}/{len(ads)}"
+                kept, fetched_n, pages, filter_mode = await self._fetch_region_ads(
+                    niche, region, max_kept
                 )
-                for ad in ads:
-                    self.logger.info(
-                        f"  Ad {ad.get('id')} | {ad.get('page_name')}: "
-                        f"{self._public_ad_link(ad)}"
-                    )
-                
-                # Rate limiting between regions only (skip after the last one)
-                if i < len(regions) - 1:
-                    await asyncio.sleep(self.rate_limit_delay)
-                
             except requests.exceptions.RequestException as e:
                 self.logger.error(f"Failed to fetch ads for {region}: {e}")
                 continue
-        
+
+            page_names = sorted({
+                ad.get("page_name") or "Unknown" for ad in kept
+            })
+            self.logger.info(
+                f"[REAL Meta API] '{niche}' in {region}: fetched {fetched_n} ads "
+                f"across {pages} pages, kept {len(kept)} on-niche ({filter_mode})"
+            )
+            if page_names:
+                self.logger.info(f"  Kept advertisers: {', '.join(page_names)}")
+            for ad in kept:
+                self.logger.info(
+                    f"  Ad {ad.get('id')} | {ad.get('page_name')}: "
+                    f"{self._public_ad_link(ad)}"
+                )
+
+            all_ads.extend(kept)
+
+            if i < len(regions) - 1:
+                await asyncio.sleep(self.rate_limit_delay)
+
         return all_ads
+
+    async def _fetch_region_ads(
+        self,
+        niche: str,
+        region: str,
+        max_kept: int,
+    ) -> Tuple[List[Dict[str, Any]], int, int, str]:
+        """Paginate Meta ads_archive for one region and filter each page."""
+        session = self._get_session()
+        url: Optional[str] = f"{self.api_base}/ads_archive"
+        params: Optional[Dict[str, Any]] = {
+            "access_token": self.access_token,
+            "search_terms": niche,
+            "ad_reached_countries": region,
+            "ad_active_status": "ACTIVE",
+            "limit": config.ad_discovery.ads_per_query,
+            "fields": COMMERCIAL_AD_FIELDS,
+        }
+
+        kept: List[Dict[str, Any]] = []
+        seen_ids: set = set()
+        fetched_n = 0
+        pages = 0
+        modes: List[str] = []
+
+        while url and pages < MAX_META_PAGES and len(kept) < max_kept:
+            if pages > 0:
+                await asyncio.sleep(self.rate_limit_delay)
+
+            if params:
+                response = session.get(url, params=params)
+            else:
+                response = session.get(url)
+            response.raise_for_status()
+            data = response.json()
+
+            pages += 1
+            raw_ads = data.get("data") or []
+            fetched_n += len(raw_ads)
+
+            for ad in raw_ads:
+                ad["target_region"] = region
+                ad["niche"] = niche
+
+            if raw_ads:
+                page_kept, mode = self._filter_page_on_niche(raw_ads, niche)
+                modes.append(mode)
+                for ad in page_kept:
+                    ad_id = str(ad.get("id") or "")
+                    if not ad_id or ad_id in seen_ids:
+                        continue
+                    seen_ids.add(ad_id)
+                    kept.append(ad)
+                    if len(kept) >= max_kept:
+                        break
+
+            next_url = (data.get("paging") or {}).get("next")
+            url = next_url if next_url else None
+            params = None  # paging.next is a full URL
+
+        kept = kept[:max_kept]
+        filter_mode = self._summarize_filter_mode(modes)
+        return kept, fetched_n, pages, filter_mode
+
+    @staticmethod
+    def _summarize_filter_mode(modes: List[str]) -> str:
+        if not modes:
+            return "no ads fetched"
+        unique = set(modes)
+        if unique == {"llm"}:
+            return "LLM filter"
+        if unique == {"fallback"}:
+            return "keyword fallback — LLM filter skipped"
+        return "LLM filter + keyword fallback on some pages"
+
+    def _filter_page_on_niche(
+        self, ads: List[Dict[str, Any]], niche: str
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """
+        Keep ads genuinely about the niche. One LLM call for the whole page;
+        keyword fallback if the LLM is disabled, unconfigured, or fails.
+        """
+        nf = getattr(config.ad_discovery, "niche_filter", None)
+        enabled = bool(getattr(nf, "enabled", True)) if nf is not None else True
+
+        if not enabled:
+            if not self._llm_skip_logged:
+                self.logger.warning(
+                    "⚠️  LLM niche filter disabled in config. Using keyword fallback."
+                )
+                self._llm_skip_logged = True
+            return self._fallback_filter_ads(ads, niche), "fallback"
+
+        key = self._llm_api_key()
+        if not key:
+            if not self._llm_skip_logged:
+                provider = (getattr(nf, "provider", None) or "anthropic").lower()
+                env_name = (
+                    "ANTHROPIC_API_KEY" if provider == "anthropic" else "OPENAI_API_KEY"
+                )
+                self.logger.warning(
+                    f"⚠️  LLM niche filter skipped ({env_name} missing or placeholder). "
+                    "Using keyword fallback."
+                )
+                self._llm_skip_logged = True
+            return self._fallback_filter_ads(ads, niche), "fallback"
+
+        try:
+            kept_ids = self._llm_select_on_niche_ids(ads, niche, key)
+            id_set = {str(i) for i in kept_ids}
+            kept = [ad for ad in ads if str(ad.get("id") or "") in id_set]
+            self.logger.info(
+                f"LLM niche filter ran: kept {len(kept)}/{len(ads)} ads on this page"
+            )
+            return kept, "llm"
+        except Exception as e:
+            self.logger.warning(
+                f"⚠️  LLM niche filter failed ({e}). Using keyword fallback."
+            )
+            return self._fallback_filter_ads(ads, niche), "fallback"
+
+    def _llm_api_key(self) -> Optional[str]:
+        nf = getattr(config.ad_discovery, "niche_filter", None)
+        provider = (getattr(nf, "provider", None) or "anthropic").lower()
+        if provider == "anthropic":
+            key = settings.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
+        elif provider == "openai":
+            key = settings.openai_api_key or os.getenv("OPENAI_API_KEY")
+        else:
+            return None
+        key = (key or "").strip()
+        if not key or key.lower().startswith(_PLACEHOLDER_KEY_PREFIX):
+            return None
+        return key
+
+    def _llm_select_on_niche_ids(
+        self, ads: List[Dict[str, Any]], niche: str, api_key: str
+    ) -> List[str]:
+        compact = []
+        for ad in ads:
+            compact.append({
+                "id": str(ad.get("id") or ""),
+                "page_name": ad.get("page_name") or "",
+                "ad_copy": self._ad_copy(ad),
+            })
+        numbered = "\n".join(
+            f"{idx}. {json.dumps(item, ensure_ascii=False)}"
+            for idx, item in enumerate(compact, 1)
+        )
+        prompt = (
+            f"Here is a numbered list of ads. The target niche is '{niche}'. "
+            "Return a JSON array of the ids that are genuinely about this niche "
+            "(the product/category), excluding unrelated ads that only matched "
+            "by loose keyword. Return only JSON.\n\n"
+            f"{numbered}"
+        )
+        nf = config.ad_discovery.niche_filter
+        provider = (nf.provider or "anthropic").lower()
+        model = nf.model or "claude-sonnet-4-6"
+        raw_text = self._call_llm(provider, model, prompt, api_key)
+        return self._parse_id_list(raw_text)
+
+    def _call_llm(
+        self, provider: str, model: str, prompt: str, api_key: str
+    ) -> str:
+        if provider == "anthropic":
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            body = response.json()
+            parts = body.get("content") or []
+            texts = [
+                p.get("text", "") for p in parts if isinstance(p, dict)
+            ]
+            return "\n".join(texts).strip()
+
+        if provider == "openai":
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0,
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            body = response.json()
+            choices = body.get("choices") or []
+            if not choices:
+                raise ValueError("OpenAI response had no choices")
+            return (choices[0].get("message") or {}).get("content") or ""
+
+        raise ValueError(f"Unsupported niche_filter.provider: {provider}")
+
+    @staticmethod
+    def _parse_id_list(text: str) -> List[str]:
+        """Parse a JSON array of ad ids from an LLM response."""
+        if not text or not str(text).strip():
+            raise ValueError("empty LLM response")
+        cleaned = str(text).strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError("LLM response did not contain a JSON array")
+        data = json.loads(cleaned[start:end + 1])
+        if not isinstance(data, list):
+            raise ValueError("LLM JSON was not an array")
+        return [str(item) for item in data if item is not None and str(item)]
+
+    @staticmethod
+    def _ad_copy(ad: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        for field in ("ad_creative_bodies", "ad_creative_link_titles"):
+            value = ad.get(field) or []
+            if isinstance(value, list):
+                parts.extend(str(v) for v in value if v)
+            elif value:
+                parts.append(str(value))
+        return " ".join(parts)[:400]
+
+    def _fallback_filter_ads(
+        self, ads: List[Dict[str, Any]], niche: str
+    ) -> List[Dict[str, Any]]:
+        """Keep ads whose page_name or copy contains all niche words."""
+        words = [
+            w for w in re.findall(r"[a-z0-9]+", (niche or "").lower()) if len(w) >= 2
+        ]
+        if not words:
+            return []
+        kept = []
+        for ad in ads:
+            text = f"{ad.get('page_name') or ''} {self._ad_copy(ad)}".lower()
+            if all(word in text for word in words):
+                kept.append(ad)
+        return kept
 
     @staticmethod
     def _public_ad_link(ad: Dict[str, Any]) -> str:
