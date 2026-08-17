@@ -21,8 +21,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from agents.base import BaseAgent
-from utils import config, settings
+from utils import DATA_DIR, config, settings
 from utils.scoring import qualify_leads
+
+PAGE_ID_CACHE_PATH = DATA_DIR / "page_id_cache.json"
 
 # Commercial-ad fields that the Ad Library actually returns without extra
 # permissions. spend and impressions are usually ABSENT for non-EU commercial
@@ -69,6 +71,7 @@ class ProspectAgent(BaseAgent):
         self.apollo_api_key = settings.apollo_api_key
         self.meta_access_token = settings.meta_access_token
         self.meta_api_base = "https://graph.facebook.com/v18.0"
+        self._page_id_cache = self._load_page_id_cache()
 
     def _meta_api_configured(self) -> bool:
         """True when a real (non-placeholder) Meta access token is set."""
@@ -327,12 +330,12 @@ class ProspectAgent(BaseAgent):
         """
         Query Meta Ad Library for a specific brand by Facebook Page ID.
 
-        Vanity URLs are resolved via ads_archive search_terms + page_name
-        matching, then presence is counted with search_page_ids. Unrelated
-        keyword hits are discarded and never treated as this brand's ads.
+        Page IDs come from the manual cache, then a numeric URL, then (if
+        enabled) ads_archive name search. Presence is counted with
+        search_page_ids. Unrelated keyword hits are never treated as ads.
         """
         try:
-            page_id = await self._resolve_facebook_page_id(
+            page_id, resolved_via = await self._resolve_facebook_page_id(
                 brand_name, brand_domain, facebook_url, regions
             )
             library_url = self._ad_library_page_url(page_id, regions)
@@ -341,8 +344,8 @@ class ProspectAgent(BaseAgent):
                 self.logger.info(
                     f"[REAL Meta API] {brand_name}: page unresolved | "
                     f"facebook_url={facebook_url or 'absent'} | "
-                    f"lookup=unresolved | match_confidence=0.20 "
-                    f"(not treated as 0 ads)"
+                    f"resolved_via=unresolved | lookup=unresolved | "
+                    f"match_confidence=0.20 (not treated as 0 ads)"
                 )
                 return {
                     'active_ads_count': 0,
@@ -413,7 +416,7 @@ class ProspectAgent(BaseAgent):
                 f"[REAL Meta API] {brand_name}: {len(ads)} ads | "
                 f"page_id={page_id} | "
                 f"page_name={'present (' + ', '.join(unique_page_names[:3]) + ')' if unique_page_names else 'absent'} | "
-                f"lookup={lookup} | "
+                f"resolved_via={resolved_via} | lookup={lookup} | "
                 f"match_confidence={match_confidence:.2f}"
             )
             if library_url:
@@ -644,68 +647,101 @@ class ProspectAgent(BaseAgent):
             if self._page_name_matches_brand(brand_name, ad.get("page_name") or "")
         ]
 
+    def _load_page_id_cache(self) -> Dict[str, str]:
+        """
+        Read data/page_id_cache.json (normalized brand name → classic Page ID).
+
+        Missing, empty, or invalid files are treated as no cache. Never writes.
+        """
+        path = PAGE_ID_CACHE_PATH
+        if not path.is_file():
+            self.logger.info(
+                f"Page ID cache absent ({path}); brands resolve as unresolved "
+                "unless a numeric Facebook URL is present"
+            )
+            return {}
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+            if not raw:
+                self.logger.info(f"Page ID cache empty ({path})")
+                return {}
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as e:
+            self.logger.warning(
+                f"Page ID cache unreadable ({path}): {e}; treating as no cache"
+            )
+            return {}
+        if not isinstance(data, dict):
+            self.logger.warning(
+                f"Page ID cache is not a JSON object ({path}); treating as no cache"
+            )
+            return {}
+
+        cache: Dict[str, str] = {}
+        for key, value in data.items():
+            norm = self._alnum_key(str(key))
+            page_id = str(value).strip() if value is not None else ""
+            if norm and page_id:
+                cache[norm] = page_id
+        self.logger.info(f"Loaded {len(cache)} page IDs from {path}")
+        return cache
+
+    def _page_id_from_cache(self, brand_name: str) -> Optional[str]:
+        key = self._alnum_key(brand_name)
+        if not key:
+            return None
+        return self._page_id_cache.get(key)
+
     async def _resolve_facebook_page_id(
         self,
         brand_name: str,
         brand_domain: Optional[str] = None,
         facebook_url: Optional[str] = None,
         regions: Optional[List[str]] = None,
-    ) -> Optional[str]:
+    ) -> Tuple[Optional[str], str]:
         """
-        Resolve a brand's Facebook Page ID for ads_archive search_page_ids.
+        Resolve a classic Facebook Page ID for ads_archive search_page_ids.
 
-        Order: numeric id on a known URL, then ads_archive page_name match
-        (vanity URLs), then HTML scrape / Pages Search as last resorts.
+        Order: manual cache, numeric ID on a known URL, then (if enabled)
+        ads_archive search_terms + page_name match. Returns (page_id, source)
+        where source is cache | url | name-search | unresolved.
         """
         regions = regions or ["US"]
+
+        cached = self._page_id_from_cache(brand_name)
+        if cached:
+            self.logger.info(
+                f"[REAL Meta API] {brand_name}: page_id={cached} resolved via cache"
+            )
+            return cached, "cache"
 
         for candidate in (facebook_url, brand_domain):
             page_id = self._page_id_from_facebook_url(candidate)
             if page_id and self._ads_archive_accepts_page_id(page_id, regions):
-                return page_id
+                self.logger.info(
+                    f"[REAL Meta API] {brand_name}: page_id={page_id} resolved via url"
+                )
+                return page_id, "url"
 
-        page_id, fetched, matched_n = self._resolve_page_id_from_ad_library(
-            brand_name, regions
-        )
-        if page_id and self._ads_archive_accepts_page_id(page_id, regions):
-            return page_id
-        if page_id:
-            # Matched ads named this brand, but ads_archive rejected the id
-            # (new-style page ids). Still return it; caller may use it in URLs.
-            return page_id
-        if fetched and matched_n == 0:
-            # Ad Library returned ads, none named this brand. Do not fall
-            # through to Graph name-search junk as if they were this page.
-            return None
+        if config.prospect.enable_name_search_resolver:
+            page_id, fetched, matched_n = self._resolve_page_id_from_ad_library(
+                brand_name, regions
+            )
+            if page_id:
+                self.logger.info(
+                    f"[REAL Meta API] {brand_name}: page_id={page_id} "
+                    "resolved via name-search"
+                )
+                return page_id, "name-search"
+            # Matched 0 (or fetch failed): do not treat keyword junk as this page.
+            self.logger.info(
+                f"[REAL Meta API] {brand_name}: page_id unresolved "
+                f"(name-search fetched {fetched}, matched {matched_n})"
+            )
+            return None, "unresolved"
 
-        if facebook_url:
-            page_id = self._page_id_from_facebook_html(facebook_url)
-            if page_id and self._ads_archive_accepts_page_id(page_id, regions):
-                return page_id
-
-        try:
-            params = {
-                'access_token': self.meta_access_token,
-                'q': brand_name,
-                'type': 'page',
-                'fields': 'id,name,link',
-                'limit': 5,
-            }
-            session = self._get_session()
-            response = session.get(f"{self.meta_api_base}/search", params=params)
-            response.raise_for_status()
-            pages = response.json().get('data') or []
-            brand_l = (brand_name or "").lower()
-            for page in pages:
-                page_name = (page.get('name') or "").lower()
-                if brand_l and (brand_l in page_name or page_name in brand_l):
-                    pid = str(page.get('id') or "")
-                    if pid:
-                        return pid
-        except Exception as e:
-            self.logger.debug(f"Could not resolve Facebook Page ID for {brand_name}: {e}")
-
-        return None
+        self.logger.info(f"[REAL Meta API] {brand_name}: page_id unresolved")
+        return None, "unresolved"
 
     @staticmethod
     def _page_id_from_facebook_url(url: Optional[str]) -> Optional[str]:
@@ -745,31 +781,6 @@ class ProspectAgent(BaseAgent):
             return True
         except Exception:
             return False
-
-    def _page_id_from_facebook_html(self, facebook_url: str) -> Optional[str]:
-        """Best-effort page id from a public Facebook URL (vanity pages)."""
-        try:
-            session = self._get_session()
-            response = session.get(
-                facebook_url,
-                timeout=8,
-                headers={'User-Agent': 'Mozilla/5.0'},
-                allow_redirects=True,
-            )
-            html = response.text or ""
-        except Exception as e:
-            self.logger.debug(f"Facebook page fetch failed for {facebook_url}: {e}")
-            return None
-        for pat in (
-            r'"pageID":"(\d{5,})"',
-            r'"page_id":"?(\d{5,})"?',
-            r'fb://page/(\d{5,})',
-            r'fb://profile/(\d{5,})',
-        ):
-            match = re.search(pat, html)
-            if match:
-                return match.group(1)
-        return None
 
     @staticmethod
     def _ad_library_page_url(page_id: Optional[str], regions: List[str]) -> Optional[str]:

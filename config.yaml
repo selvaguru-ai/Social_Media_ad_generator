@@ -56,6 +56,10 @@ prospect:
     brand_maturity: 0.3
     low_ad_presence: 0.3
 
+  # Keyword ads_archive search to guess a Page ID. Leave false unless you
+  # explicitly want it — it rarely finds classic IDs for vanity URLs.
+  enable_name_search_resolver: false
+
 # Contact Enrichment agent settings
 contact_enrichment:
   # Job titles to search for

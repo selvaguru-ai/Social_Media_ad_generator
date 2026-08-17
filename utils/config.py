@@ -53,6 +53,9 @@ class ProspectConfig(BaseModel):
     max_company_size: int = 500
     max_ad_spend_threshold: int = 5000
     qualification_weights: Dict[str, float] = Field(default_factory=dict)
+    # ads_archive search_terms + page_name match. Off by default: it burns
+    # rate limit and rarely resolves major brands (keyword junk, no classic ID).
+    enable_name_search_resolver: bool = False
 
 
 class ContactEnrichmentConfig(BaseModel):
