@@ -12,7 +12,8 @@ Approach:
 import asyncio
 import json
 import re
-from typing import Any, Dict, List, Optional
+from collections import Counter
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 
 import requests
@@ -326,12 +327,13 @@ class ProspectAgent(BaseAgent):
         """
         Query Meta Ad Library for a specific brand by Facebook Page ID.
 
-        Keyword search_terms is NOT used for presence — it matches unrelated
-        ads (romance/drama pages) and both inflates and zeros counts wrongly.
+        Vanity URLs are resolved via ads_archive search_terms + page_name
+        matching, then presence is counted with search_page_ids. Unrelated
+        keyword hits are discarded and never treated as this brand's ads.
         """
         try:
             page_id = await self._resolve_facebook_page_id(
-                brand_name, brand_domain, facebook_url
+                brand_name, brand_domain, facebook_url, regions
             )
             library_url = self._ad_library_page_url(page_id, regions)
 
@@ -373,10 +375,18 @@ class ProspectAgent(BaseAgent):
 
             session = self._get_session()
             response = session.get(f"{self.meta_api_base}/ads_archive", params=params)
-            response.raise_for_status()
-
-            data = response.json()
-            ads = data.get('data') or []
+            ads = []
+            lookup = "search_page_ids"
+            if response.status_code == 400:
+                self.logger.info(
+                    f"[REAL Meta API] {brand_name}: search_page_ids rejected "
+                    f"page_id={page_id}; using page_name-matched ads as footprint"
+                )
+                ads = self._matched_ads_for_brand(brand_name, regions)
+                lookup = "page_name_match"
+            else:
+                response.raise_for_status()
+                ads = response.json().get('data') or []
 
             total_spend, spend_present = self._sum_optional_range(ads, 'spend')
             total_impressions, impressions_present = self._sum_optional_range(
@@ -389,6 +399,7 @@ class ProspectAgent(BaseAgent):
             unique_page_names = sorted(set(page_names))
             primary_page_name = unique_page_names[0] if unique_page_names else None
 
+            # Page-ID (or page_name) match is a high-confidence identity.
             match_confidence = 1.0 if ads else 0.85
 
             has_low_presence = len(ads) < 5
@@ -402,7 +413,7 @@ class ProspectAgent(BaseAgent):
                 f"[REAL Meta API] {brand_name}: {len(ads)} ads | "
                 f"page_id={page_id} | "
                 f"page_name={'present (' + ', '.join(unique_page_names[:3]) + ')' if unique_page_names else 'absent'} | "
-                f"lookup=search_page_ids | "
+                f"lookup={lookup} | "
                 f"match_confidence={match_confidence:.2f}"
             )
             if library_url:
@@ -422,7 +433,7 @@ class ProspectAgent(BaseAgent):
                 'page_unresolved': False,
                 'library_url': library_url,
                 'source': 'meta_api',
-                'lookup': 'search_page_ids',
+                'lookup': lookup,
             }
 
         except Exception as e:
@@ -527,26 +538,149 @@ class ProspectAgent(BaseAgent):
             return 0.7
         return 0.5
     
+    @staticmethod
+    def _alnum_key(text: str) -> str:
+        """Lowercase and strip non-alphanumerics for page_name matching."""
+        return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+    def _page_name_matches_brand(self, brand_name: str, page_name: str) -> bool:
+        """
+        True when page_name is the brand, not a loose keyword hit.
+
+        Both sides are lowercased with non-alphanumerics stripped. Exact
+        match always counts; substring match only when the brand token is
+        at least 4 characters (avoids short-name collisions).
+        """
+        brand_key = self._alnum_key(brand_name)
+        page_key = self._alnum_key(page_name)
+        if not brand_key or not page_key:
+            return False
+        if brand_key == page_key:
+            return True
+        if len(brand_key) >= 4 and (brand_key in page_key or page_key in brand_key):
+            return True
+        return False
+
+    def _resolve_page_id_from_ad_library(
+        self, brand_name: str, regions: List[str]
+    ) -> Tuple[Optional[str], int, int]:
+        """
+        Find a Facebook Page ID by searching ads_archive, then keeping only
+        ads whose page_name matches the brand.
+
+        Returns (page_id, fetched_count, matched_count).
+        """
+        params = {
+            "access_token": self.meta_access_token,
+            "search_terms": brand_name,
+            "ad_type": "ALL",
+            "ad_active_status": "ALL",
+            "limit": 100,
+            "fields": "id,page_id,page_name",
+        }
+        if regions:
+            params["ad_reached_countries"] = json.dumps(regions)
+
+        try:
+            response = self._get_session().get(
+                f"{self.meta_api_base}/ads_archive", params=params, timeout=30
+            )
+            response.raise_for_status()
+            ads = response.json().get("data") or []
+        except Exception as e:
+            safe = re.sub(r"access_token=[^&\s]+", "access_token=REDACTED", str(e))
+            self.logger.warning(
+                f"[REAL Meta API] {brand_name}: ads_archive name search failed ({safe})"
+            )
+            return None, 0, 0
+
+        fetched = len(ads)
+        matched = [
+            ad for ad in ads
+            if ad.get("page_id") and self._page_name_matches_brand(
+                brand_name, ad.get("page_name") or ""
+            )
+        ]
+        matched_n = len(matched)
+        page_id = None
+        if matched:
+            counts = Counter(str(ad.get("page_id")) for ad in matched)
+            page_id = counts.most_common(1)[0][0]
+            verdict = "advertising"
+        else:
+            verdict = "no ads found"
+
+        self.logger.info(
+            f"[REAL Meta API] {brand_name}: fetched {fetched}, "
+            f"matched {matched_n} by page_name, resolved page_id={page_id or 'none'}, "
+            f"verdict={verdict}"
+        )
+        return page_id, fetched, matched_n
+
+    def _matched_ads_for_brand(
+        self, brand_name: str, regions: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Return ads_archive hits whose page_name matches the brand."""
+        params = {
+            "access_token": self.meta_access_token,
+            "search_terms": brand_name,
+            "ad_type": "ALL",
+            "ad_active_status": "ALL",
+            "limit": 100,
+            "fields": COMMERCIAL_AD_FIELDS,
+        }
+        if regions:
+            params["ad_reached_countries"] = json.dumps(regions)
+        try:
+            response = self._get_session().get(
+                f"{self.meta_api_base}/ads_archive", params=params, timeout=30
+            )
+            response.raise_for_status()
+            ads = response.json().get("data") or []
+        except Exception:
+            return []
+        return [
+            ad for ad in ads
+            if self._page_name_matches_brand(brand_name, ad.get("page_name") or "")
+        ]
+
     async def _resolve_facebook_page_id(
         self,
         brand_name: str,
         brand_domain: Optional[str] = None,
         facebook_url: Optional[str] = None,
+        regions: Optional[List[str]] = None,
     ) -> Optional[str]:
         """
         Resolve a brand's Facebook Page ID for ads_archive search_page_ids.
 
-        Graph Pages Search is usually empty without extra app review. Prefer
-        Apollo's facebook_url, then try to extract a numeric page id.
+        Order: numeric id on a known URL, then ads_archive page_name match
+        (vanity URLs), then HTML scrape / Pages Search as last resorts.
         """
+        regions = regions or ["US"]
+
         for candidate in (facebook_url, brand_domain):
             page_id = self._page_id_from_facebook_url(candidate)
-            if page_id and self._ads_archive_accepts_page_id(page_id, ["US"]):
+            if page_id and self._ads_archive_accepts_page_id(page_id, regions):
                 return page_id
+
+        page_id, fetched, matched_n = self._resolve_page_id_from_ad_library(
+            brand_name, regions
+        )
+        if page_id and self._ads_archive_accepts_page_id(page_id, regions):
+            return page_id
+        if page_id:
+            # Matched ads named this brand, but ads_archive rejected the id
+            # (new-style page ids). Still return it; caller may use it in URLs.
+            return page_id
+        if fetched and matched_n == 0:
+            # Ad Library returned ads, none named this brand. Do not fall
+            # through to Graph name-search junk as if they were this page.
+            return None
 
         if facebook_url:
             page_id = self._page_id_from_facebook_html(facebook_url)
-            if page_id and self._ads_archive_accepts_page_id(page_id, ["US"]):
+            if page_id and self._ads_archive_accepts_page_id(page_id, regions):
                 return page_id
 
         try:
@@ -565,9 +699,9 @@ class ProspectAgent(BaseAgent):
             for page in pages:
                 page_name = (page.get('name') or "").lower()
                 if brand_l and (brand_l in page_name or page_name in brand_l):
-                    return str(page['id'])
-            if pages:
-                return str(pages[0].get('id') or "") or None
+                    pid = str(page.get('id') or "")
+                    if pid:
+                        return pid
         except Exception as e:
             self.logger.debug(f"Could not resolve Facebook Page ID for {brand_name}: {e}")
 
