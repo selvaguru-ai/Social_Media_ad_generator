@@ -60,6 +60,16 @@ prospect:
   # explicitly want it — it rarely finds classic IDs for vanity URLs.
   enable_name_search_resolver: false
 
+  # Unioned into search_page_ids country filters. US-only misses commercial
+  # ads Meta tags as GB/EU even when the Ad Library UI still shows them.
+  presence_country_fallback:
+    - GB
+    - CA
+    - AU
+    - DE
+    - FR
+    - IE
+
 # Contact Enrichment agent settings
 contact_enrichment:
   # Job titles to search for

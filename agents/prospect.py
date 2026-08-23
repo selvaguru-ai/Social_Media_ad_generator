@@ -71,7 +71,7 @@ class ProspectAgent(BaseAgent):
         self.apollo_api_key = settings.apollo_api_key
         self.meta_access_token = settings.meta_access_token
         self.meta_api_base = "https://graph.facebook.com/v18.0"
-        self._page_id_cache = self._load_page_id_cache()
+        self._page_id_cache, self._page_id_ads_floor = self._load_page_id_cache()
 
     def _meta_api_configured(self) -> bool:
         """True when a real (non-placeholder) Meta access token is set."""
@@ -373,8 +373,9 @@ class ProspectAgent(BaseAgent):
                 'limit': 100,
                 'fields': COMMERCIAL_AD_FIELDS,
             }
-            if regions:
-                params['ad_reached_countries'] = json.dumps(regions)
+            presence_countries = self._presence_countries(regions)
+            if presence_countries:
+                params['ad_reached_countries'] = json.dumps(presence_countries)
 
             session = self._get_session()
             response = session.get(f"{self.meta_api_base}/ads_archive", params=params)
@@ -402,10 +403,23 @@ class ProspectAgent(BaseAgent):
             unique_page_names = sorted(set(page_names))
             primary_page_name = unique_page_names[0] if unique_page_names else None
 
-            # Page-ID (or page_name) match is a high-confidence identity.
-            match_confidence = 1.0 if ads else 0.85
+            api_count = len(ads)
+            ads_count = api_count
+            floor = self._ads_floor_from_cache(brand_name)
+            if floor is not None and floor > ads_count:
+                # ads_archive often omits US commercial ads the Ad Library UI
+                # still shows. Cache ads_count is the UI figure.
+                ads_count = floor
+                lookup = f"{lookup}+ui_override"
+                self.logger.info(
+                    f"[REAL Meta API] {brand_name}: ads_archive returned "
+                    f"{api_count}; using cache ads_count={floor} from Ad Library UI"
+                )
 
-            has_low_presence = len(ads) < 5
+            # Page-ID (or page_name) match is a high-confidence identity.
+            match_confidence = 1.0 if ads_count else 0.85
+
+            has_low_presence = ads_count < 5
             if spend_present:
                 has_low_presence = (
                     has_low_presence
@@ -413,17 +427,18 @@ class ProspectAgent(BaseAgent):
                 )
 
             self.logger.info(
-                f"[REAL Meta API] {brand_name}: {len(ads)} ads | "
+                f"[REAL Meta API] {brand_name}: {ads_count} ads | "
                 f"page_id={page_id} | "
                 f"page_name={'present (' + ', '.join(unique_page_names[:3]) + ')' if unique_page_names else 'absent'} | "
                 f"resolved_via={resolved_via} | lookup={lookup} | "
+                f"reached_countries={','.join(presence_countries)} | "
                 f"match_confidence={match_confidence:.2f}"
             )
             if library_url:
                 self.logger.info(f"  Ad Library: {library_url}")
 
             return {
-                'active_ads_count': len(ads),
+                'active_ads_count': ads_count,
                 'estimated_spend': total_spend if spend_present else 0,
                 'total_impressions': total_impressions if impressions_present else 0,
                 'spend_present': spend_present,
@@ -647,50 +662,81 @@ class ProspectAgent(BaseAgent):
             if self._page_name_matches_brand(brand_name, ad.get("page_name") or "")
         ]
 
-    def _load_page_id_cache(self) -> Dict[str, str]:
+    def _load_page_id_cache(self) -> Tuple[Dict[str, str], Dict[str, int]]:
         """
-        Read data/page_id_cache.json (normalized brand name → classic Page ID).
+        Read data/page_id_cache.json.
+
+        Values may be a classic Page ID string, or an object:
+          {"page_id": "123", "ads_count": 280}
+        ads_count is an optional Ad Library UI floor when ads_archive
+        returns 0 for a page the UI still shows as advertising.
 
         Missing, empty, or invalid files are treated as no cache. Never writes.
         """
         path = PAGE_ID_CACHE_PATH
+        empty: Tuple[Dict[str, str], Dict[str, int]] = ({}, {})
         if not path.is_file():
             self.logger.info(
                 f"Page ID cache absent ({path}); brands resolve as unresolved "
                 "unless a numeric Facebook URL is present"
             )
-            return {}
+            return empty
         try:
             raw = path.read_text(encoding="utf-8").strip()
             if not raw:
                 self.logger.info(f"Page ID cache empty ({path})")
-                return {}
+                return empty
             data = json.loads(raw)
         except (OSError, json.JSONDecodeError) as e:
             self.logger.warning(
                 f"Page ID cache unreadable ({path}): {e}; treating as no cache"
             )
-            return {}
+            return empty
         if not isinstance(data, dict):
             self.logger.warning(
                 f"Page ID cache is not a JSON object ({path}); treating as no cache"
             )
-            return {}
+            return empty
 
         cache: Dict[str, str] = {}
+        floors: Dict[str, int] = {}
         for key, value in data.items():
             norm = self._alnum_key(str(key))
-            page_id = str(value).strip() if value is not None else ""
-            if norm and page_id:
+            if not norm:
+                continue
+            page_id = ""
+            ads_count = None
+            if isinstance(value, dict):
+                page_id = str(value.get("page_id") or value.get("id") or "").strip()
+                raw_count = value.get("ads_count")
+                if raw_count is not None:
+                    try:
+                        ads_count = int(raw_count)
+                    except (TypeError, ValueError):
+                        ads_count = None
+            elif value is not None:
+                page_id = str(value).strip()
+            if page_id:
                 cache[norm] = page_id
-        self.logger.info(f"Loaded {len(cache)} page IDs from {path}")
-        return cache
+            if ads_count is not None and ads_count >= 0:
+                floors[norm] = ads_count
+        self.logger.info(
+            f"Loaded {len(cache)} page IDs from {path}"
+            + (f" ({len(floors)} with UI ads_count)" if floors else "")
+        )
+        return cache, floors
 
     def _page_id_from_cache(self, brand_name: str) -> Optional[str]:
         key = self._alnum_key(brand_name)
         if not key:
             return None
         return self._page_id_cache.get(key)
+
+    def _ads_floor_from_cache(self, brand_name: str) -> Optional[int]:
+        key = self._alnum_key(brand_name)
+        if not key:
+            return None
+        return self._page_id_ads_floor.get(key)
 
     async def _resolve_facebook_page_id(
         self,
@@ -781,6 +827,23 @@ class ProspectAgent(BaseAgent):
             return True
         except Exception:
             return False
+
+    def _presence_countries(self, regions: Optional[List[str]]) -> List[str]:
+        """
+        Countries to send as ad_reached_countries for a presence check.
+
+        Target regions first, then a fallback list. Meta frequently tags
+        commercial ads as GB/EU even when the Ad Library UI shows them on
+        a US Page — US-only then reports 0 ads and false-qualifies the brand.
+        """
+        fallback = getattr(config.prospect, "presence_country_fallback", None) or [
+            "GB", "CA", "AU", "DE", "FR", "IE"
+        ]
+        out: List[str] = []
+        for country in list(regions or []) + list(fallback):
+            if country and country not in out:
+                out.append(country)
+        return out
 
     @staticmethod
     def _ad_library_page_url(page_id: Optional[str], regions: List[str]) -> Optional[str]:

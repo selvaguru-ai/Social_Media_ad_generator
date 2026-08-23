@@ -56,6 +56,12 @@ class ProspectConfig(BaseModel):
     # ads_archive search_terms + page_name match. Off by default: it burns
     # rate limit and rarely resolves major brands (keyword junk, no classic ID).
     enable_name_search_resolver: bool = False
+    # Extra countries unioned into ads_archive presence checks. Meta often
+    # tags commercial ads as GB/EU even when the Ad Library UI shows them
+    # for a US page (US-only then false-zeros the brand).
+    presence_country_fallback: List[str] = Field(
+        default_factory=lambda: ["GB", "CA", "AU", "DE", "FR", "IE"]
+    )
 
 
 class ContactEnrichmentConfig(BaseModel):
