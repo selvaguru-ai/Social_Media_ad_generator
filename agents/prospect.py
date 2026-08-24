@@ -95,6 +95,8 @@ class ProspectAgent(BaseAgent):
                 - qualification_summary: Stats on the lead generation
         """
         self.log_start()
+        # Harvest may have just written page IDs for this niche.
+        self._page_id_cache, self._page_id_ads_floor = self._load_page_id_cache()
         
         try:
             niche = context.get('niche') or config.market.niche
@@ -228,6 +230,7 @@ class ProspectAgent(BaseAgent):
                         'industry': company.get('industry') or niche,
                         'region': region,
                         'source': 'apollo',
+                        'company': self._company_card(company, niche),
                     })
                     self.logger.info(
                         f"  Apollo: {company.get('name')} | {website or '(no website)'}"
@@ -798,6 +801,7 @@ class ProspectAgent(BaseAgent):
             r'profile\.php\?id=(\d{5,})',
             r'/pages/[^/]+/(\d{5,})',
             r'facebook\.com/(?:profile\.php\?id=)?(\d{5,})\b',
+            r'facebook\.com/[^/?#]+-(\d{10,})(?:[/?#]|$)',
         ]
         for pat in patterns:
             match = re.search(pat, url)
@@ -852,15 +856,50 @@ class ProspectAgent(BaseAgent):
         country = (regions[0] if regions else "US")
         return (
             "https://www.facebook.com/ads/library/"
-            f"?active_status=active&ad_type=all&country={country}"
+            f"?active_status=all&ad_type=all&country={country}"
             "&is_targeted_country=false&media_type=all&search_type=page"
             "&sort_data[direction]=desc&sort_data[mode]=total_impressions"
             f"&view_all_page_id={page_id}"
         )
     
+    @staticmethod
+    def _company_card(company: Dict[str, Any], niche: str) -> Dict[str, Any]:
+        """Org fields shown on the verify card. No people or emails."""
+        keywords = company.get("keywords") or []
+        if isinstance(keywords, str):
+            keywords = [keywords]
+        primary_phone = company.get("primary_phone")
+        phone = company.get("phone") or company.get("sanitized_phone")
+        if not phone and isinstance(primary_phone, dict):
+            phone = primary_phone.get("number")
+        return {
+            "apollo_id": company.get("id"),
+            "logo_url": company.get("logo_url"),
+            "website_url": company.get("website_url") or company.get("primary_domain"),
+            "primary_domain": company.get("primary_domain"),
+            "facebook_url": company.get("facebook_url"),
+            "linkedin_url": company.get("linkedin_url"),
+            "twitter_url": company.get("twitter_url"),
+            "short_description": company.get("short_description") or company.get("seo_description"),
+            "industry": company.get("industry") or niche,
+            "keywords": [str(item) for item in keywords[:8] if item],
+            "city": company.get("city"),
+            "state": company.get("state"),
+            "country": company.get("country"),
+            "estimated_num_employees": company.get("estimated_num_employees"),
+            "founded_year": company.get("founded_year"),
+            "annual_revenue": company.get("annual_revenue"),
+            "annual_revenue_printed": company.get("annual_revenue_printed"),
+            "total_funding": company.get("total_funding"),
+            "latest_funding_stage": company.get("latest_funding_stage"),
+            "publicly_traded_symbol": company.get("publicly_traded_symbol"),
+            "phone": phone,
+        }
+
     def _get_session(self) -> requests.Session:
         """Create a requests session with retry logic."""
         session = requests.Session()
+        session.trust_env = False
         retry_strategy = Retry(
             total=3,
             backoff_factor=2,
@@ -894,13 +933,20 @@ class ProspectAgent(BaseAgent):
         ]
         
         for i, name in enumerate(brand_names):
+            domain = f"https://{name.lower().replace(' ', '')}.com"
             mock_brands.append({
                 'name': name,
-                'domain': f"https://{name.lower().replace(' ', '')}.com",
+                'domain': domain,
                 'size': random.randint(15, 200),
                 'industry': niche,
                 'region': random.choice(regions) if regions else 'US',
                 'source': 'mock',
+                'company': {
+                    'website_url': domain,
+                    'short_description': f"Mock {niche} brand for local dashboard testing.",
+                    'industry': niche,
+                    'estimated_num_employees': random.randint(15, 200),
+                },
             })
         
         return mock_brands

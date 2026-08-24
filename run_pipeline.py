@@ -3,12 +3,13 @@
 Full pipeline CLI runner.
 
 Usage:
-    python run_pipeline.py [niche] [--regions US,GB,CA] [--resume]
+    python run_pipeline.py [niche] [--regions US,GB,CA] [--resume] [--until prospect] [--full]
     
 Examples:
     python run_pipeline.py "sustainable fashion"
     python run_pipeline.py "pet food" --regions US,CA
-    python run_pipeline.py --resume  # Resume from saved state
+    python run_pipeline.py --resume  # Resume remaining stages after verification
+    python run_pipeline.py "sports shoes" --full  # Skip the verify pause
 """
 import asyncio
 import sys
@@ -19,14 +20,16 @@ from orchestrator import main as run_orchestrator
 from utils import console, config
 
 
-async def run_pipeline_async(niche: str, regions: str, resume: bool):
-    """Run the full prospect-to-pitch pipeline (async implementation)."""
-    regions_list = regions.split(',') if regions else None
-    
+async def run_pipeline_async(niche: str, regions: str, resume: bool, until: str, full: bool):
+    """Run the prospect-to-pitch pipeline (async implementation)."""
+    regions_list = [item.strip().upper() for item in regions.split(",") if item.strip()] if regions else None
+    until_stage = None if resume or full or until == "end" else until
+
     await run_orchestrator(
         niche=niche,
         regions=regions_list,
-        resume=resume
+        resume=resume,
+        until=until_stage,
     )
 
 
@@ -42,9 +45,20 @@ async def run_pipeline_async(niche: str, regions: str, resume: bool):
     is_flag=True,
     help='Resume from saved pipeline state'
 )
-def run_pipeline(niche: str, regions: str, resume: bool):
-    """Run the full prospect-to-pitch pipeline."""
-    asyncio.run(run_pipeline_async(niche, regions, resume))
+@click.option(
+    '--until',
+    default='prospect',
+    type=click.Choice(['prospect', 'end'], case_sensitive=False),
+    help='Stop after this stage so Ad Library pages can be verified (default: prospect).',
+)
+@click.option(
+    '--full',
+    is_flag=True,
+    help='Run every remaining stage without the verification pause.',
+)
+def run_pipeline(niche: str, regions: str, resume: bool, until: str, full: bool):
+    """Run the prospect-to-pitch pipeline."""
+    asyncio.run(run_pipeline_async(niche, regions, resume, until, full))
 
 
 if __name__ == "__main__":

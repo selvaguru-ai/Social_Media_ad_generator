@@ -49,18 +49,14 @@ class PipelineOrchestrator:
         self,
         niche: Optional[str] = None,
         regions: Optional[list[str]] = None,
-        resume_from_state: bool = False
+        resume_from_state: bool = False,
+        until: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Run the full pipeline.
-        
-        Args:
-            niche: Target industry/niche (uses config if not provided)
-            regions: Target regions (uses config if not provided)
-            resume_from_state: Whether to resume from saved state
-        
-        Returns:
-            Complete pipeline results
+        Run the pipeline, optionally pausing after Prospect.
+
+        until='prospect' stops after scoring so the dashboard can verify
+        Ad Library pages before people search / video / outreach spend credits.
         """
         console.print("\n[bold cyan]🚀 Starting Ad Generator & Outreach Pipeline[/bold cyan]\n")
         
@@ -92,16 +88,34 @@ class PipelineOrchestrator:
                     context
                 )
                 context.update(prospect_result)
+                context['prospect_leads'] = list(context.get('leads') or [])
                 context['completed_stages'].append('prospect')
                 self._save_state(context)
                 
                 # Check if we found leads
                 if not context.get('leads'):
                     console.print("[red]❌ No qualified leads found. Pipeline stopped.[/red]")
+                    context["status"] = "completed"
+                    context["error"] = "No qualified leads found."
+                    self._save_state(context)
+                    return context
+
+                if until == "prospect":
+                    context["status"] = "awaiting_verification"
+                    self._save_state(context)
+                    console.print(
+                        "\n[yellow]Paused after Prospect.[/yellow] Open the dashboard, "
+                        "verify each Ad Library page, mark Quiet leads, then Continue.\n"
+                    )
                     return context
             else:
                 console.print("[dim]Stage 2: Prospect Finding (skipped - already completed)[/dim]")
-            
+
+            context = self._apply_verified_leads(context)
+            if context.get("status") == "awaiting_verification":
+                self._save_state(context)
+                return context
+
             # Stage 3: Contact Enrichment
             if 'contact_enrichment' not in context.get('completed_stages', []):
                 console.print("\n[bold]Stage 3: Contact Enrichment[/bold]")
@@ -174,7 +188,7 @@ class PipelineOrchestrator:
         # Fresh start
         context = {
             'niche': niche or config.market.niche,
-            'regions': regions or config.market.regions,
+            'regions': [str(r).upper() for r in (regions or config.market.regions)],
             'started_at': datetime.now().isoformat(),
             'status': 'running',
             'completed_stages': [],
@@ -207,6 +221,37 @@ class PipelineOrchestrator:
                     self.logger.error(f"{agent.name} failed after {max_retries} attempts")
                     raise
     
+    def _apply_verified_leads(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep only Quiet leads before people / video / outreach.
+
+        A full run with no verify decisions keeps every scored lead.
+        After a dashboard pause, enrichment does not start until at least
+        one lead is marked Quiet.
+        """
+        pool = context.get("prospect_leads") or context.get("leads") or []
+        quiet = [
+            lead
+            for lead in pool
+            if (lead.get("verification") or {}).get("status") == "quiet"
+        ]
+        if quiet:
+            context["leads"] = quiet
+            if context.get("status") == "awaiting_verification":
+                context["status"] = "running"
+            return context
+
+        decided = any(
+            (lead.get("verification") or {}).get("status") in {"quiet", "has_ads", "skip"}
+            for lead in pool
+        )
+        if decided or context.get("status") == "awaiting_verification":
+            context["status"] = "awaiting_verification"
+            console.print(
+                "[yellow]No Quiet leads selected. Verify Ad Library pages "
+                "in the dashboard, then Continue.[/yellow]"
+            )
+        return context
+
     def _save_state(self, context: Dict[str, Any]) -> None:
         """Save pipeline state to file."""
         try:
@@ -258,11 +303,12 @@ class PipelineOrchestrator:
 async def main(
     niche: Optional[str] = None,
     regions: Optional[list[str]] = None,
-    resume: bool = False
+    resume: bool = False,
+    until: Optional[str] = None,
 ):
     """Main entry point for running the pipeline."""
     orchestrator = PipelineOrchestrator()
-    result = await orchestrator.run_pipeline(niche, regions, resume)
+    result = await orchestrator.run_pipeline(niche, regions, resume, until)
     return result
 
 

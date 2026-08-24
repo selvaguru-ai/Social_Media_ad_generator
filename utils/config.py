@@ -44,6 +44,10 @@ class AdDiscoveryConfig(BaseModel):
     max_requests_per_hour: int = 180
     backoff_seconds: int = 3
     niche_filter: NicheFilterConfig = Field(default_factory=NicheFilterConfig)
+    # Keyword harvest: several search_terms, keep unique pages, seed cache.
+    harvest_pages_per_term: int = 2
+    max_search_terms: int = 5
+    seed_page_id_cache: bool = True
 
 
 class ProspectConfig(BaseModel):

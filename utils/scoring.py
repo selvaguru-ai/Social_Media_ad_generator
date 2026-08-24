@@ -231,12 +231,17 @@ def qualify_leads(
         if r["confidence"] < 0.8:
             reasons.append("brand match is approximate (verify)")
 
+        company = brand.get("company") or {}
         leads.append({
             "brand_name": brand.get("name"),
             "domain": brand.get("domain"),
-            "company_size": brand.get("size"),
-            "industry": brand.get("industry"),
+            "company_size": brand.get("size") or company.get("estimated_num_employees"),
+            "industry": brand.get("industry") or company.get("industry"),
             "region": brand.get("region"),
+            "facebook_url": brand.get("facebook_url") or company.get("facebook_url"),
+            "linkedin_url": brand.get("linkedin_url") or company.get("linkedin_url"),
+            "company": company,
+            "verification": brand.get("verification") or {"status": "pending"},
             "ad_presence_summary": {
                 "active_ads": ap.get("active_ads_count", 0),
                 "estimated_spend": ap.get("estimated_spend", 0),

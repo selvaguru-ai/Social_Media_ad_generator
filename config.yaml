@@ -18,10 +18,16 @@ market:
 ad_discovery:
   # Number of ads to fetch per Meta page
   ads_per_query: 20
-  # Stop once this many on-niche ads are kept (pagination may fetch more)
-  max_kept_ads: 10
+  # Stop once this many harvested ads are kept for pattern/sample display
+  max_kept_ads: 40
+  # Pages of ads_archive per search-term variant (rate-limit sensitive)
+  harvest_pages_per_term: 2
+  max_search_terms: 5
+  # Write harvested page_id + page_name into data/page_id_cache.json
+  seed_page_id_cache: true
 
-  # LLM relevance filter — keeps ads genuinely about the niche
+  # LLM filter is not applied to the advertiser harvest (unique pages).
+  # Keep enabled only if you later tag sample copy separately.
   niche_filter:
     provider: anthropic # or "openai"
     model: claude-sonnet-4-6

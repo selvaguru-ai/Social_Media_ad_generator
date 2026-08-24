@@ -4,6 +4,7 @@ Contact Enrichment agent
 Finds brand/marketing managers and their contact information for each qualified lead.
 """
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -57,15 +58,10 @@ class ContactEnrichmentAgent(BaseAgent):
             
             for lead in leads:
                 contact_info = await self._find_contact(lead)
-                
-                if contact_info and contact_info.get('email'):
-                    lead['contact'] = contact_info
-                    enriched_leads.append(lead)
+                lead['contact'] = contact_info
+                enriched_leads.append(lead)
+                if contact_info:
                     successful += 1
-                else:
-                    # Still include the lead, but mark as missing contact
-                    lead['contact'] = None
-                    enriched_leads.append(lead)
             
             result = {
                 'enriched_leads': enriched_leads,
@@ -112,10 +108,98 @@ class ContactEnrichmentAgent(BaseAgent):
         return None
     
     async def _find_contact_apollo(self, lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Find contact using Apollo API."""
-        # TODO: Implement Apollo people search
-        # Docs: https://apolloio.github.io/apollo-api-docs/?shell#search-for-people
-        return None
+        """People search only — does not unlock / reveal emails."""
+        domain = self._lead_domain(lead)
+        if not domain:
+            self.logger.warning(f"No domain for {lead.get('brand_name')}; skip people search")
+            return None
+
+        headers = {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-cache",
+            "X-Api-Key": self.apollo_api_key,
+        }
+        payload = {
+            "q_organization_domains_list": [domain],
+            "person_titles": list(config.contact_enrichment.target_roles),
+            "page": 1,
+            "per_page": 5,
+        }
+
+        try:
+            session = self._get_session()
+            response = session.post(
+                "https://api.apollo.io/v1/mixed_people/search",
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+            if not response.ok:
+                self.logger.error(
+                    f"Apollo people search failed for {domain}: "
+                    f"{response.status_code} {response.text[:300]}"
+                )
+                return None
+            people = (response.json() or {}).get("people") or []
+        except requests.exceptions.RequestException as error:
+            self.logger.error(f"Apollo people search error for {domain}: {error}")
+            return None
+
+        if not people:
+            self.logger.info(f"Apollo people search: no contacts for {domain}")
+            return None
+
+        person = people[0]
+        email = person.get("email")
+        if email and str(email).endswith("email_not_unlocked@domain.com"):
+            email = None
+
+        contact = {
+            "name": " ".join(
+                part for part in (person.get("first_name"), person.get("last_name")) if part
+            ) or person.get("name"),
+            "title": person.get("title"),
+            "email": email,
+            "linkedin": person.get("linkedin_url"),
+            "confidence": 0.7 if email else 0.45,
+            "source": "apollo",
+            "email_revealed": bool(email),
+        }
+        self.logger.info(
+            f"Apollo people: {contact['name']} · {contact['title']} · "
+            f"{domain} · email={'yes' if email else 'locked'}"
+        )
+        return contact
+
+    @staticmethod
+    def _lead_domain(lead: Dict[str, Any]) -> Optional[str]:
+        raw = (
+            lead.get("domain")
+            or (lead.get("company") or {}).get("primary_domain")
+            or (lead.get("company") or {}).get("website_url")
+            or ""
+        )
+        text = str(raw).strip()
+        if not text:
+            return None
+        if "://" not in text:
+            text = f"https://{text}"
+        host = urlparse(text).netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host or None
+
+    def _get_session(self) -> requests.Session:
+        session = requests.Session()
+        session.trust_env = False
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=2,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        return session
     
     async def _find_contact_hunter(self, lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Find contact using Hunter.io API."""

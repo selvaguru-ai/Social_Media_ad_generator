@@ -1,0 +1,1642 @@
+/* Hallmark · Lumen night foundry console
+ *
+ * Renders the five console views from the pipeline API. Every number displayed
+ * is read from the API response; nothing is estimated or filled in client-side.
+ * Missing values render as an em-dash, never as a plausible-looking zero.
+ */
+
+const SECTIONS = [
+  { id: "overview", label: "Overview", icon: "i-overview" },
+  { id: "leads", label: "Leads", icon: "i-leads" },
+  { id: "market", label: "Market", icon: "i-market" },
+  { id: "approvals", label: "Approvals", icon: "i-approvals" },
+  { id: "runs", label: "Runs", icon: "i-runs" },
+];
+
+const state = {
+  section: "overview",
+  health: null,
+  config: null,
+  overview: null,
+  leads: null,
+  // Unfiltered copy so the command palette searches every lead, not just the
+  // rows the Leads table filters happen to be showing.
+  allLeads: null,
+  market: null,
+  messages: null,
+  runs: null,
+  leadQuery: { search: "", region: "", stage: "", sort: "score", order: "desc", verification: "" },
+  selectedMessage: null,
+  paletteIndex: 0,
+  paletteRows: [],
+};
+
+/* ------------------------------------------------------------------ helpers */
+
+const view = document.getElementById("view");
+const railNav = document.getElementById("rail-nav");
+const sheetNav = document.getElementById("sheet-nav");
+const statusline = document.getElementById("statusline");
+const toasts = document.getElementById("toasts");
+const palette = document.getElementById("palette");
+const paletteInput = document.getElementById("palette-input");
+const paletteList = document.getElementById("palette-list");
+const drawer = document.getElementById("drawer");
+
+function esc(value) {
+  if (value === null || value === undefined) return "";
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function href(url) {
+  if (!url) return "";
+  const text = String(url).trim();
+  if (!/^https?:\/\//i.test(text)) return "";
+  return esc(text);
+}
+
+/** Em-dash for absent data. A missing number is never rendered as 0. */
+function num(value, digits = 0) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "—";
+  return Number(value).toLocaleString(undefined, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  });
+}
+
+function score(value) {
+  if (value === null || value === undefined) return "—";
+  return Number(value).toFixed(3);
+}
+
+function percent(value) {
+  if (value === null || value === undefined) return "—";
+  return `${Math.round(Number(value) * 100)}%`;
+}
+
+function when(iso) {
+  if (!iso) return "—";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function icon(id, size = 16) {
+  return `<svg width="${size}" height="${size}" aria-hidden="true"><use href="#${id}" /></svg>`;
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(`/api${path}`, {
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+  if (!response.ok) {
+    const detail = payload && payload.detail ? payload.detail : `Request failed (${response.status})`;
+    const error = new Error(detail);
+    error.status = response.status;
+    throw error;
+  }
+  return payload;
+}
+
+/* Silent success is the default; toasts carry failures and undoable actions. */
+function toast(message, { kind = "positive", undo = null, timeout = 10000, key = null } = {}) {
+  // One toast per subject: a second decision on the same draft replaces the
+  // first rather than stacking two Undo links that mean different things.
+  if (key) {
+    toasts.querySelectorAll(`[data-toast-key="${CSS.escape(key)}"]`).forEach((old) => old.remove());
+  }
+  const node = document.createElement("div");
+  node.className = `toast toast--${kind}`;
+  if (key) node.dataset.toastKey = key;
+  node.innerHTML = `
+    ${icon(kind === "critical" ? "i-alert" : "i-check", 16)}
+    <span>${esc(message)}</span>
+    ${undo ? '<button class="toast__undo" type="button">Undo</button>' : ""}
+  `;
+  if (undo) {
+    node.querySelector(".toast__undo").addEventListener("click", () => {
+      node.remove();
+      undo();
+    });
+  }
+  toasts.append(node);
+  window.setTimeout(() => node.remove(), timeout);
+}
+
+/* --------------------------------------------------------------- components */
+
+function emptyState(title, body, hint) {
+  return `
+    <div class="empty">
+      ${icon("i-empty", 28)}
+      <h3>${esc(title)}</h3>
+      <p>${esc(body)}</p>
+      ${hint ? `<p><code>${esc(hint)}</code></p>` : ""}
+    </div>
+  `;
+}
+
+function mockBanner(integrations) {
+  const missing = (integrations || []).filter((item) => !item.configured);
+  if (!missing.length) return "";
+  const names = missing.map((item) => item.label).join(", ");
+  return `
+    <div class="banner">
+      ${icon("i-alert", 18)}
+      <div class="banner__body">
+        <strong>Mock data.</strong> ${esc(names)} ${missing.length === 1 ? "has" : "have"}
+        no credentials configured, so the pipeline generated placeholder records for
+        ${missing.length === 1 ? "that stage" : "those stages"}. Add the keys to
+        <code>.env</code> and re-run to replace them.
+      </div>
+    </div>
+  `;
+}
+
+function statusChip(status) {
+  const map = {
+    approved: ["positive", "i-check", "Approved"],
+    sent: ["positive", "i-check", "Sent"],
+    rejected: ["critical", "i-close", "Rejected"],
+    pending: ["caution", "i-alert", "Awaiting"],
+    complete: ["positive", "i-check", "Complete"],
+    running: ["accent", "i-play", "Running"],
+    failed: ["critical", "i-alert", "Failed"],
+    cancelled: ["critical", "i-close", "Cancelled"],
+    succeeded: ["positive", "i-check", "Succeeded"],
+    awaiting_verification: ["caution", "i-alert", "Verify pages"],
+    quiet: ["positive", "i-check", "Quiet"],
+    has_ads: ["critical", "i-close", "Has ads"],
+    skip: ["", "i-close", "Skip"],
+    scored: ["caution", "i-alert", "Needs check"],
+  };
+  const [kind, glyph, label] = map[status] || ["", "i-alert", status || "unknown"];
+  return `<span class="chip${kind ? ` chip--${kind}` : ""}">${icon(glyph, 12)}${esc(label)}</span>`;
+}
+
+function gauge(label, value, muted = false) {
+  const width = value === null || value === undefined ? 0 : Math.max(0, Math.min(1, value)) * 100;
+  return `
+    <div class="gauge">
+      <span class="gauge__label">${esc(label)}</span>
+      <span class="gauge__track">
+        <span class="gauge__fill${muted ? " gauge__fill--muted" : ""}" style="width: ${width}%"></span>
+      </span>
+      <span class="gauge__value">${score(value)}</span>
+    </div>
+  `;
+}
+
+function factRow(key, value) {
+  return `
+    <div class="factlist__row">
+      <span class="factlist__key">${esc(key)}</span>
+      <span class="factlist__value">${value}</span>
+    </div>
+  `;
+}
+
+/* -------------------------------------------------------------------- views */
+
+function spectrumFromScores(leads) {
+  const scores = (leads || [])
+    .map((lead) => lead.qualification_score)
+    .filter((value) => typeof value === "number")
+    .sort((a, b) => a - b);
+  if (scores.length < 2) return "";
+
+  const bars = 64;
+  const lo = Math.min(...scores);
+  const hi = Math.max(...scores);
+  const ticks = [];
+  for (let i = 0; i < bars; i += 1) {
+    const t = scores.length === 1 ? 0 : (i / (bars - 1)) * (scores.length - 1);
+    const i0 = Math.floor(t);
+    const i1 = Math.min(scores.length - 1, i0 + 1);
+    const frac = t - i0;
+    const value = scores[i0] * (1 - frac) + scores[i1] * frac;
+    const norm = hi === lo ? 0.5 : (value - lo) / (hi - lo);
+    const height = 18 + Math.round(norm * 82);
+    const opacity = 0.28 + norm * 0.72;
+    ticks.push(`<span style="height:${height}%;--o:${opacity.toFixed(2)}"></span>`);
+  }
+
+  return `
+    <aside class="spectrum" aria-label="Lead score envelope">
+      <p class="spectrum__label spectrum__label--left">low · ${score(lo)}</p>
+      <div class="spectrum__bars">${ticks.join("")}</div>
+      <p class="spectrum__label spectrum__label--right">high · ${score(hi)}</p>
+    </aside>
+  `;
+}
+
+function apparatus(totals, scores) {
+  const callouts = [
+    totals.leads != null ? { side: "left", y: "18%", text: `qualified · ${num(totals.leads)}` } : null,
+    scores.average != null ? { side: "right", y: "36%", text: `avg score · ${score(scores.average)}` } : null,
+    totals.awaiting_decision != null
+      ? { side: "left", y: "62%", text: `awaiting · ${num(totals.awaiting_decision)}` }
+      : null,
+    totals.brands_analyzed != null
+      ? { side: "right", y: "80%", text: `analysed · ${num(totals.brands_analyzed)}` }
+      : null,
+  ].filter(Boolean);
+
+  return `
+    <figure class="apparatus" aria-hidden="true">
+      <div class="chamber">
+        <span class="chamber__electrode" style="--y: 22%"></span>
+        <span class="chamber__electrode" style="--y: 42%"></span>
+        <span class="chamber__electrode" style="--y: 62%"></span>
+        <span class="chamber__electrode" style="--y: 82%"></span>
+        <span class="chamber__filament"></span>
+        <span class="chamber__glow"></span>
+        <span class="chamber__stencil">rx-04</span>
+      </div>
+      <ul class="callouts">
+        ${callouts
+          .map(
+            (item) =>
+              `<li class="callout callout--${item.side}" style="--y: ${item.y}"><span>${esc(item.text)}</span></li>`,
+          )
+          .join("")}
+      </ul>
+    </figure>
+  `;
+}
+
+function renderOverview() {
+  const data = state.overview;
+  if (!data) return emptyState("No run yet", "The console reads what the pipeline writes to data/. Run it once to populate this view.", 'python run_pipeline.py "sustainable fashion"');
+
+  const t = data.totals;
+  const funnel = data.funnel
+    .map((stage, index) => {
+      const ratio =
+        stage.total && stage.count !== null && stage.count !== undefined
+          ? stage.count / stage.total
+          : stage.count
+            ? 1
+            : 0;
+      const denominator = stage.total ? ` <span>/ ${num(stage.total)}</span>` : "";
+      return `
+        <li class="funnel__stage" data-status="${esc(stage.status)}">
+          <span class="funnel__index">${String(index + 1).padStart(2, "0")}</span>
+          <div class="funnel__label">
+            <span class="funnel__name">${esc(stage.label)}</span>
+            <span class="funnel__count">${num(stage.count)}${denominator} ${statusChip(stage.status)}</span>
+          </div>
+          <p class="funnel__summary">${esc(stage.summary)}</p>
+          <span class="funnel__bar"><span class="funnel__fill" style="width: ${ratio * 100}%"></span></span>
+        </li>
+      `;
+    })
+    .join("");
+
+  const integrations = (state.health?.integrations || [])
+    .map(
+      (item) => `
+        <div class="factlist__row">
+          <span class="factlist__key">${esc(item.label)}<br /><span class="table__sub">${esc(item.purpose)}</span></span>
+          <span class="factlist__value">${
+            item.configured
+              ? statusChip("complete")
+              : `<span class="chip chip--caution">${icon("i-alert", 12)}mock</span>`
+          }</span>
+        </div>
+      `,
+    )
+    .join("");
+
+  const waiting =
+    t.awaiting_decision > 0
+      ? `
+        <div class="banner">
+          ${icon("i-alert", 18)}
+          <div class="banner__body">
+            <strong>${num(t.awaiting_decision)} draft${t.awaiting_decision === 1 ? "" : "s"} awaiting your decision.</strong>
+            nothing sends until you approve it.
+            <a href="#approvals">open the approval queue</a>.
+          </div>
+        </div>
+      `
+      : "";
+
+  const verifyBanner =
+    data.status === "awaiting_verification" || (t.awaiting_verification || 0) > 0
+      ? `
+        <div class="banner">
+          ${icon("i-alert", 18)}
+          <div class="banner__body">
+            <strong>${num(t.awaiting_verification)} lead${t.awaiting_verification === 1 ? "" : "s"} need an Ad Library check.</strong>
+            API counts miss ads the Facebook page view still shows. Open each page, then mark Quiet to continue.
+            <a href="#leads">open leads</a>.
+          </div>
+        </div>
+      `
+      : "";
+
+  const canStats = t.leads != null && t.awaiting_decision != null && data.scores.average != null;
+
+  return `
+    <section class="hero enter">
+      <div class="hero__copy">
+        <span class="eyebrow">00 · ${esc(data.run_id)} · ${esc(data.status || "unknown")}</span>
+        <h1>quiet brands. loud market. ready to&nbsp;<em class="verb">pitch</em>.</h1>
+        <p class="lede">
+          ${esc(data.niche || "untitled niche")} · ${esc((data.regions || []).join(" · ") || "no regions")} —
+          started ${esc(when(data.started_at))}${data.completed_at ? `, finished ${esc(when(data.completed_at))}` : ""}.
+        </p>
+      </div>
+      ${apparatus(t, data.scores)}
+    </section>
+
+    ${spectrumFromScores(state.allLeads?.leads || state.leads?.leads)}
+
+    ${
+      canStats
+        ? `<div class="statrow">
+            <div class="stat">
+              <span class="stat__label">qualified</span>
+              <span class="stat__value">${num(t.leads)}</span>
+              <span class="stat__note">${num(t.pitch_ready)} pitch-ready</span>
+            </div>
+            <div class="stat">
+              <span class="stat__label">awaiting</span>
+              <span class="stat__value">${num(t.awaiting_decision)}</span>
+              <span class="stat__note">${num(t.drafted)} drafted · sending off</span>
+            </div>
+            <div class="stat">
+              <span class="stat__label">avg score</span>
+              <span class="stat__value">${score(data.scores.average)}</span>
+              <span class="stat__note">${score(data.scores.low)} – ${score(data.scores.top)}</span>
+            </div>
+          </div>`
+        : ""
+    }
+
+    ${data.error ? `<div class="banner banner--critical">${icon("i-alert", 18)}<div class="banner__body"><strong>run failed.</strong> ${esc(data.error)}</div></div>` : ""}
+    ${verifyBanner}
+    ${waiting}
+    ${mockBanner(state.health?.integrations)}
+
+    <div class="split">
+      <section class="panel--flush panel">
+        <div class="panel__head">
+          <div>
+            <span class="eyebrow" style="display:block;margin-block-end:var(--space-2xs)">01 · funnel</span>
+            <h2>stage by stage</h2>
+          </div>
+          <span class="tag">reached / eligible</span>
+        </div>
+        <div class="panel__body">
+          <ol class="funnel">${funnel}</ol>
+        </div>
+      </section>
+
+      <div class="stack">
+        <section class="panel">
+          <span class="eyebrow" style="display:block;margin-block-end:var(--space-sm)">02 · outreach</span>
+          <div class="factlist">
+            ${factRow("Drafted", num(t.drafted))}
+            ${factRow("Approved", num(t.approved))}
+            ${factRow("Rejected", num(t.rejected))}
+            ${factRow("Sent", num(t.sent))}
+            ${factRow("Brands analysed", num(t.brands_analyzed))}
+            ${factRow("Competitor ads", num(t.active_ads))}
+          </div>
+        </section>
+
+        <section class="panel">
+          <span class="eyebrow" style="display:block;margin-block-end:var(--space-sm)">03 · sources</span>
+          <div class="factlist">${integrations}</div>
+        </section>
+      </div>
+    </div>
+  `;
+}
+
+function verificationChip(lead) {
+  const status = (lead.verification || {}).status || "pending";
+  if (status === "quiet") return statusChip("quiet");
+  if (status === "has_ads") return statusChip("has_ads");
+  if (status === "skip") return statusChip("skip");
+  if (lead.stage === "pitch-ready") return statusChip("complete");
+  if (lead.stage === "contacted") return `<span class="chip">contact only</span>`;
+  return statusChip("scored");
+}
+
+function leadLinks(lead) {
+  const ads = lead.ad_presence_summary || {};
+  const company = lead.company || {};
+  const library = href(ads.library_url);
+  const site = href(lead.domain || company.website_url);
+  const linkedin = href(lead.linkedin_url || company.linkedin_url);
+  const facebook = href(lead.facebook_url || company.facebook_url);
+  const parts = [];
+  if (library) {
+    parts.push(
+      `<a class="btn btn--sm btn--primary" href="${library}" target="_blank" rel="noreferrer noopener" data-stop>${icon("i-external", 13)} Ad Library</a>`,
+    );
+  }
+  if (site) parts.push(`<a class="lead-link" href="${site}" target="_blank" rel="noreferrer noopener" data-stop>site</a>`);
+  if (linkedin) parts.push(`<a class="lead-link" href="${linkedin}" target="_blank" rel="noreferrer noopener" data-stop>linkedin</a>`);
+  if (facebook) parts.push(`<a class="lead-link" href="${facebook}" target="_blank" rel="noreferrer noopener" data-stop>facebook</a>`);
+  return parts.join(" ") || "—";
+}
+
+function renderLeads() {
+  const data = state.leads;
+  const q = state.leadQuery;
+  const quietCount = data?.quiet_count || 0;
+  const pendingCount = data?.pending_count || 0;
+  const runBusy = Boolean(state.runs?.active?.active);
+
+  const regionOptions = ["", ...((data && data.regions) || [])]
+    .map(
+      (region) =>
+        `<option value="${esc(region)}"${region === q.region ? " selected" : ""}>${
+          region ? esc(region) : "All regions"
+        }</option>`,
+    )
+    .join("");
+
+  const stageOptions = [
+    ["", "All stages"],
+    ["scored", "Needs check"],
+    ["quiet", "Quiet"],
+    ["rejected", "Has ads / skip"],
+    ["contacted", "Contact only"],
+    ["pitch-ready", "Pitch-ready"],
+  ]
+    .map(
+      ([value, label]) =>
+        `<option value="${esc(value)}"${value === q.stage ? " selected" : ""}>${esc(label)}</option>`,
+    )
+    .join("");
+
+  const sortOptions = [
+    ["score", "Score"],
+    ["name", "Brand"],
+    ["size", "Company size"],
+    ["ads", "Active ads"],
+    ["confidence", "Match confidence"],
+  ]
+    .map(
+      ([value, label]) =>
+        `<option value="${esc(value)}"${value === q.sort ? " selected" : ""}>${esc(label)}</option>`,
+    )
+    .join("");
+
+  const rows = (data?.leads || [])
+    .map((lead) => {
+      const ads = lead.ad_presence_summary || {};
+      const company = lead.company || {};
+      const verify = (lead.verification || {}).status || "pending";
+      const hq = [company.city, company.state, company.country].filter(Boolean).join(", ");
+      return `
+        <tr class="table__row" tabindex="0" data-lead="${esc(lead.id)}">
+          <td data-label="Brand">
+            <span>
+              <span class="table__brand">${esc(lead.brand_name)}</span><br />
+              <span class="table__sub">${esc(company.short_description || lead.industry || "No description")}</span>
+            </span>
+          </td>
+          <td data-label="HQ"><span class="table__sub">${esc(hq || lead.region || "—")}</span></td>
+          <td data-label="Size" class="num">${num(lead.company_size || company.estimated_num_employees)}</td>
+          <td data-label="API ads" class="num">${num(ads.active_ads)}</td>
+          <td data-label="Score" class="num">${score(lead.qualification_score)}</td>
+          <td data-label="Check">${verificationChip(lead)}</td>
+          <td data-label="Links"><div class="lead-links">${leadLinks(lead)}</div></td>
+          <td data-label="Decide">
+            <div class="verify-actions">
+              <button class="btn btn--sm btn--positive" type="button" data-verify="quiet" data-lead-id="${esc(lead.id)}" ${verify === "quiet" ? "disabled" : ""} data-stop>Quiet</button>
+              <button class="btn btn--sm btn--critical" type="button" data-verify="has_ads" data-lead-id="${esc(lead.id)}" ${verify === "has_ads" ? "disabled" : ""} data-stop>Has ads</button>
+              <button class="btn btn--sm btn--quiet" type="button" data-verify="skip" data-lead-id="${esc(lead.id)}" ${verify === "skip" ? "disabled" : ""} data-stop>Skip</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  const weights = data?.weights || {};
+  const weightLine = Object.entries(weights)
+    .map(([key, value]) => `${key.replaceAll("_", " ")} ${value}`)
+    .join(" · ");
+
+  return `
+    <div class="page-head enter">
+      <span class="eyebrow">01 · prospect</span>
+      <h1>open the page. then&nbsp;<em class="verb">decide</em>.</h1>
+      <p class="lede">
+        API ad counts miss ads the Facebook Page view still shows. Open Ad Library for each brand,
+        mark Quiet only when the page is actually empty, then continue.
+        ${weightLine ? `ranked by ${esc(weightLine)}.` : ""}
+      </p>
+    </div>
+
+    <section class="panel verify-bar">
+      <div>
+        <div class="tag" style="display:block;margin-block-end:var(--space-xs)">verification gate</div>
+        <p class="lede" style="font-size:var(--text-sm)">
+          ${num(pendingCount)} still unchecked · ${num(quietCount)} marked quiet.
+          continue runs people, email (if already unlocked), video, and draft only for quiet brands.
+        </p>
+      </div>
+      <button class="btn btn--primary" type="button" data-action="continue-quiet" ${quietCount && !runBusy ? "" : "disabled"}>
+        ${icon("i-play", 15)} continue ${num(quietCount)} quiet
+      </button>
+    </section>
+
+    <div class="toolbar">
+      <div class="field">
+        <label class="field__label" for="lead-search">Search</label>
+        <input
+          class="input"
+          id="lead-search"
+          type="search"
+          placeholder="Brand, domain, or contact"
+          value="${esc(q.search)}"
+          data-filter="search"
+        />
+      </div>
+      <div class="field">
+        <label class="field__label" for="lead-region">Region</label>
+        <select class="select" id="lead-region" data-filter="region">${regionOptions}</select>
+      </div>
+      <div class="field">
+        <label class="field__label" for="lead-stage">Stage</label>
+        <select class="select" id="lead-stage" data-filter="stage">${stageOptions}</select>
+      </div>
+      <div class="field">
+        <label class="field__label" for="lead-sort">Sort by</label>
+        <select class="select" id="lead-sort" data-filter="sort">${sortOptions}</select>
+      </div>
+    </div>
+
+    <section class="panel panel--flush">
+      <div class="panel__head">
+        <h2 style="font-size: var(--text-md)">${num(data?.count)} lead${data?.count === 1 ? "" : "s"}</h2>
+        <span class="tag">api count is not the website · open the page</span>
+      </div>
+      ${
+        rows
+          ? `<div class="table-scroll">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th scope="col">Brand</th>
+                    <th scope="col">HQ</th>
+                    <th scope="col" class="num">Size</th>
+                    <th scope="col" class="num">API ads</th>
+                    <th scope="col" class="num">Score</th>
+                    <th scope="col">Check</th>
+                    <th scope="col">Links</th>
+                    <th scope="col">Decide</th>
+                  </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+              </table>
+            </div>`
+          : `<div class="panel__body">${emptyState(
+              "No leads to verify",
+              "Start a run from the Runs page. It pauses after Prospect so you can check Ad Library pages before people search spends Apollo credits.",
+              'python run_pipeline.py "sports shoes" --regions US',
+            )}</div>`
+      }
+    </section>
+  `;
+}
+
+function renderMarket() {
+  const data = state.market;
+  if (!data) return emptyState("No market data", "Run the pipeline to populate the ad-discovery stage.", 'python run_pipeline.py "sustainable fashion"');
+
+  const advertisers = (data.advertisers || [])
+    .map((item) => {
+      const library = href(item.library_url);
+      const pageId = item.page_id ? `<code>${esc(item.page_id)}</code>` : "—";
+      const libraryBtn = library
+        ? `<a class="btn btn--sm btn--primary" href="${library}" target="_blank" rel="noreferrer noopener">${icon("i-external", 13)} Ad Library</a>`
+        : "—";
+      return `
+        <tr>
+          <td data-label="Advertiser"><span class="table__brand">${esc(item.name)}</span></td>
+          <td data-label="Page ID">${pageId}</td>
+          <td data-label="Ads" class="num">${num(item.ad_count)}</td>
+          <td data-label="Impressions" class="num">${num(item.total_impressions)}</td>
+          <td data-label="Spend" class="num">${
+            item.estimated_spend ? num(item.estimated_spend) : "—"
+          }</td>
+          <td data-label="Check">${libraryBtn}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  const maxRegion = Math.max(1, ...Object.values(data.ads_per_region || {}));
+  const regions = Object.entries(data.ads_per_region || {})
+    .sort((a, b) => b[1] - a[1])
+    .map(
+      ([region, count]) => `
+        <div class="gauge">
+          <span class="gauge__label">${esc(region)}</span>
+          <span class="gauge__track">
+            <span class="gauge__fill" style="width: ${(count / maxRegion) * 100}%"></span>
+          </span>
+          <span class="gauge__value">${num(count)}</span>
+        </div>
+      `,
+    )
+    .join("");
+
+  const hooks = (data.patterns?.common_hooks || [])
+    .map((hook) => `<span class="chip chip--accent">${esc(hook)}</span>`)
+    .join(" ");
+
+  const copy = (data.patterns?.sample_copy || []).map((line) => esc(line)).join("\n");
+
+  return `
+    <div class="page-head enter">
+      <span class="eyebrow">02 · ad discovery</span>
+      <h1>who is already&nbsp;<em class="verb">running</em> ads.</h1>
+      <p class="lede">
+        who is already advertising in ${esc(data.niche || "this niche")}. this is the intel the pitch
+        leans on — a lead is worth contacting because these brands are spending and they are not.
+      </p>
+      ${
+        (data.search_terms || []).length
+          ? `<p class="lede" style="font-size: var(--text-sm)">search terms: ${(data.search_terms || [])
+              .map((term) => `<span class="chip">${esc(term)}</span>`)
+              .join(" ")}</p>`
+          : ""
+      }
+    </div>
+
+    ${mockBanner(state.health?.integrations)}
+
+    <div class="split">
+      <section class="panel panel--flush">
+        <div class="panel__head">
+          <h2 style="font-size: var(--text-md)">Dominant advertisers</h2>
+          <span class="tag">${num((data.advertisers || []).length)} tracked</span>
+        </div>
+        ${
+          advertisers
+            ? `<div class="table-scroll">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Advertiser</th>
+                      <th scope="col">Page ID</th>
+                      <th scope="col" class="num">Ads</th>
+                      <th scope="col" class="num">Impressions</th>
+                      <th scope="col" class="num">Spend</th>
+                      <th scope="col">Check</th>
+                    </tr>
+                  </thead>
+                  <tbody>${advertisers}</tbody>
+                </table>
+              </div>`
+            : `<div class="panel__body">${emptyState(
+                "No advertisers recorded",
+                "Ad Discovery harvests unique Meta pages from keyword variants. If this is empty, Meta returned no ads_archive hits for those terms.",
+              )}</div>`
+        }
+      </section>
+
+      <div class="stack">
+        <section class="panel">
+          <div class="tag" style="display: block; margin-block-end: var(--space-sm)">Active ads by region</div>
+          ${regions || `<p class="lede" style="font-size: var(--text-sm)">No per-region ads recorded.</p>`}
+        </section>
+
+        <section class="panel">
+          <div class="tag" style="display: block; margin-block-end: var(--space-sm)">Recurring hooks</div>
+          ${
+            hooks ||
+            `<p class="lede" style="font-size: var(--text-sm)">No hook patterns extracted. Pattern detection is keyword-based; see TODO.md.</p>`
+          }
+        </section>
+
+        ${
+          copy
+            ? `<section class="graphite">
+                <div class="graphite__head">
+                  <span class="graphite__label">Sample competitor copy</span>
+                  <span class="graphite__label">${num((data.patterns?.sample_copy || []).length)} lines</span>
+                </div>
+                <pre class="graphite__body">${copy}</pre>
+              </section>`
+            : ""
+        }
+      </div>
+    </div>
+  `;
+}
+
+function renderApprovals() {
+  const data = state.messages;
+  if (!data) return emptyState("No drafts", "Run the pipeline through the outreach stage to draft pitches.", 'python run_pipeline.py "sustainable fashion"');
+
+  const messages = data.messages || [];
+  if (!messages.length) {
+    return `
+      <div class="page-head enter">
+        <span class="eyebrow">03 · outreach</span>
+        <h1>nothing sends until you&nbsp;<em class="verb">decide</em>.</h1>
+        <p class="lede">every pitch needs an explicit decision. nothing is waiting in this run.</p>
+      </div>
+      <section class="panel">
+        ${emptyState(
+          "Nothing drafted yet",
+          "The outreach agent drafts one pitch per lead that has both a contact and a sample video. No lead reached that state in this run.",
+          'python run_pipeline.py "sustainable fashion"',
+        )}
+      </section>
+    `;
+  }
+
+  const selected =
+    messages.find((message) => message.id === state.selectedMessage) || messages[0];
+  state.selectedMessage = selected.id;
+
+  const items = messages
+    .map(
+      (message) => `
+        <button
+          class="queue__item"
+          type="button"
+          role="option"
+          aria-selected="${message.id === selected.id}"
+          data-message="${esc(message.id)}"
+        >
+          <span class="queue__item-top">
+            <span class="queue__brand">${esc(message.lead_id)}</span>
+            ${statusChip(message.status)}
+          </span>
+          <span class="queue__meta">${esc(message.to_name)} · ${esc(message.to_email)}</span>
+          <span class="queue__meta mono">score ${score(message.qualification_score)} · ${esc(message.region || "—")}</span>
+        </button>
+      `,
+    )
+    .join("");
+
+  const gateNotice = data.approval.auto_approve
+    ? `<div class="banner banner--critical">${icon("i-alert", 18)}<div class="banner__body"><strong>Auto-approve is on.</strong> Set <code>approval.auto_approve: false</code> in <code>config.yaml</code> before running against real contacts.</div></div>`
+    : !data.approval.enabled
+      ? `<div class="banner banner--critical">${icon("i-alert", 18)}<div class="banner__body"><strong>The approval gate is disabled.</strong> Set <code>approval.enabled: true</code> in <code>config.yaml</code>.</div></div>`
+      : "";
+
+  const pending = messages.filter((message) => message.status === "pending").length;
+
+  const decided = selected.status !== "pending";
+
+  return `
+    <div class="page-head enter">
+      <span class="eyebrow">03 · outreach</span>
+      <h1>nothing sends until you&nbsp;<em class="verb">decide</em>.</h1>
+      <p class="lede">
+        every pitch needs an explicit decision before the pipeline will send it.
+        ${num(pending)} of ${num(messages.length)} still awaiting yours.
+      </p>
+    </div>
+
+    ${gateNotice}
+
+    <div class="queue">
+      <section class="panel panel--flush">
+        <div class="panel__head">
+          <h2 style="font-size: var(--text-md)">Drafts</h2>
+          <span class="tag">${num(messages.length)}</span>
+        </div>
+        <div class="queue__list" role="listbox" aria-label="Drafted messages">${items}</div>
+      </section>
+
+      <div class="stack">
+        <section class="panel">
+          <div class="head-row">
+            <div class="page-head">
+              <span class="tag">To ${esc(selected.to_name)} · ${esc(selected.contact_title || "role unknown")}</span>
+              <h2 style="font-size: var(--text-md)">${esc(selected.subject)}</h2>
+            </div>
+            ${statusChip(selected.status)}
+          </div>
+          <div class="factlist" style="margin-block-start: var(--space-md)">
+            ${factRow("Recipient", esc(selected.to_email))}
+            ${factRow("Region", esc(selected.region || "—"))}
+            ${factRow("Lead score", score(selected.qualification_score))}
+            ${factRow("Contact confidence", percent(selected.contact_confidence))}
+            ${factRow("Decided", esc(when(selected.decided_at)))}
+          </div>
+        </section>
+
+        <section class="graphite">
+          <div class="graphite__head">
+            <span class="graphite__label">Draft body</span>
+            <span class="graphite__label">${esc(selected.id)}</span>
+          </div>
+          <pre class="graphite__body">${esc(selected.body)}</pre>
+          ${
+            selected.video_url
+              ? `<div class="graphite__foot">Sample video: ${esc(selected.video_url)}</div>`
+              : ""
+          }
+        </section>
+
+        <div class="actions">
+          <button class="btn btn--primary" type="button" data-decide="approved" data-message="${esc(selected.id)}"
+            ${selected.status === "approved" ? "disabled" : ""}>
+            ${icon("i-check", 15)} Approve
+          </button>
+          <button class="btn btn--critical" type="button" data-decide="rejected" data-message="${esc(selected.id)}"
+            ${selected.status === "rejected" ? "disabled" : ""}>
+            ${icon("i-close", 15)} Reject
+          </button>
+          ${
+            decided && selected.status !== "sent"
+              ? `<button class="btn btn--quiet" type="button" data-decide="pending" data-message="${esc(selected.id)}">Clear decision</button>`
+              : ""
+          }
+          ${
+            selected.video_url
+              ? `<a class="btn" href="${esc(selected.video_url)}" target="_blank" rel="noreferrer noopener">${icon("i-external", 15)} Open video</a>`
+              : ""
+          }
+        </div>
+
+        <p class="lede" style="font-size: var(--text-sm)">
+          Decisions are written to <code>data/approvals.json</code> and mirrored into
+          <code>data/pipeline_state.json</code>, so a resumed run sees the same approved set.
+          Approving does not send: SMTP delivery is still disabled in the outreach agent.
+        </p>
+      </div>
+    </div>
+  `;
+}
+
+function renderRuns() {
+  const data = state.runs;
+  const active = data?.active?.run;
+  const isActive = Boolean(data?.active?.active);
+
+  const rows = (data?.runs || [])
+    .map(
+      (run) => `
+        <tr>
+          <td data-label="Run">
+            <span>
+              <span class="table__brand">${esc(run.id)}</span>${
+                run.is_live_state ? ` <span class="chip chip--accent">live state</span>` : ""
+              }<br />
+              <span class="table__sub">${esc(run.niche || "—")} · ${esc((run.regions || []).join(", ") || "—")}</span>
+            </span>
+          </td>
+          <td data-label="Finished"><span class="mono">${esc(when(run.completed_at || run.modified_at))}</span></td>
+          <td data-label="Leads" class="num">${num(run.leads)}</td>
+          <td data-label="Avg score" class="num">${score(run.average_score)}</td>
+          <td data-label="Drafted" class="num">${num(run.drafted)}</td>
+          <td data-label="Approved" class="num">${num(run.approved)}</td>
+          <td data-label="Status">${statusChip(run.status === "completed" ? "complete" : run.status)}</td>
+        </tr>
+      `,
+    )
+    .join("");
+
+  const config = state.config;
+
+  return `
+    <div class="page-head enter">
+      <span class="eyebrow">04 · orchestrator</span>
+      <h1>start a run. watch it&nbsp;<em class="verb">write</em>.</h1>
+      <p class="lede">
+        each run writes a report to <code>data/</code>. starting a run here shells out to the same
+        CLI entry point, with stdin closed so the terminal approval prompt is skipped — this console
+        is the gate instead.
+      </p>
+    </div>
+
+    ${
+      isActive
+        ? `<div class="banner">${icon("i-play", 18)}<div class="banner__body"><strong>Run in progress</strong> (pid ${esc(active.pid)}) since ${esc(when(active.started_at))}. ${esc((active.command || []).join(" "))}</div></div>`
+        : active
+          ? `<div class="banner${active.state === "failed" ? " banner--critical" : ""}">${icon(active.state === "failed" ? "i-alert" : "i-check", 18)}<div class="banner__body"><strong>Last launched run ${esc(active.state)}</strong> — exit code ${esc(active.exit_code ?? "—")}, finished ${esc(when(active.finished_at))}.</div></div>`
+          : ""
+    }
+
+    <section class="panel">
+      <div class="tag" style="display: block; margin-block-end: var(--space-md)">Start a run</div>
+      <form class="toolbar" id="run-form">
+        <div class="field">
+          <label class="field__label" for="run-niche">Niche</label>
+          <input class="input" id="run-niche" name="niche" type="text"
+            placeholder="${esc(config?.market?.niche || "sustainable fashion")}" />
+          <span class="field__help">Blank uses <code>market.niche</code> from config.yaml.</span>
+        </div>
+        <div class="field">
+          <label class="field__label" for="run-regions">Regions</label>
+          <input class="input" id="run-regions" name="regions" type="text"
+            placeholder="${esc((config?.market?.regions || []).join(",") || "US,GB,CA")}" />
+          <span class="field__help">Comma-separated ISO codes.</span>
+        </div>
+        <div class="field">
+          <span class="field__label" aria-hidden="true">&nbsp;</span>
+          <button class="btn btn--primary" id="run-submit" type="submit" ${isActive ? "disabled" : ""}>
+            ${icon("i-play", 15)} ${isActive ? "Run in progress" : "Start run"}
+          </button>
+          <span class="field__help">${isActive ? "One run at a time." : "Runs in the background."}</span>
+        </div>
+        <div class="field">
+          <span class="field__label" aria-hidden="true">&nbsp;</span>
+          <button class="btn" id="run-resume" type="button" data-action="resume-run" ${isActive ? "disabled" : ""}>
+            Resume last
+          </button>
+          <span class="field__help">Continues from <code>pipeline_state.json</code>.</span>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel panel--flush">
+      <div class="panel__head">
+        <h2 style="font-size: var(--text-md)">History</h2>
+        <span class="tag">${num((data?.runs || []).length)} recorded</span>
+      </div>
+      ${
+        rows
+          ? `<div class="table-scroll">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th scope="col">Run</th>
+                    <th scope="col">Finished</th>
+                    <th scope="col" class="num">Leads</th>
+                    <th scope="col" class="num">Avg score</th>
+                    <th scope="col" class="num">Drafted</th>
+                    <th scope="col" class="num">Approved</th>
+                    <th scope="col">Status</th>
+                  </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+              </table>
+            </div>`
+          : `<div class="panel__body">${emptyState(
+              "No runs recorded",
+              "Start one above, or run the CLI directly.",
+              'python run_pipeline.py "sustainable fashion" --regions US,GB,CA',
+            )}</div>`
+      }
+    </section>
+  `;
+}
+
+const RENDERERS = {
+  overview: renderOverview,
+  leads: renderLeads,
+  market: renderMarket,
+  approvals: renderApprovals,
+  runs: renderRuns,
+};
+
+/* ----------------------------------------------------------------- chrome */
+
+function navLinks(counts) {
+  return SECTIONS.map(
+    (section) => `
+      <a
+        class="nav-pill__link"
+        href="#${section.id}"
+        ${state.section === section.id ? 'aria-current="page"' : ""}
+      >
+        <span>${esc(section.label)}</span>
+        ${
+          counts[section.id] !== undefined && counts[section.id] !== null
+            ? `<span class="nav-pill__count">${num(counts[section.id])}</span>`
+            : ""
+        }
+      </a>
+    `,
+  ).join("");
+}
+
+function renderRail() {
+  const counts = {
+    leads: state.overview?.totals?.leads,
+    approvals: state.overview?.totals?.awaiting_decision,
+    market: state.overview?.totals?.advertisers,
+    runs: (state.runs?.runs || []).length || undefined,
+  };
+
+  const links = navLinks(counts);
+  railNav.innerHTML = links;
+  if (sheetNav) sheetNav.innerHTML = links;
+
+  const send = state.overview?.summaries?.send;
+  statusline.innerHTML = `
+    <span>the market is already spending. these brands are not.</span>
+    <span class="mono">
+      ${esc(state.overview?.run_id || "—")}
+      · ${num(state.overview?.totals?.leads)} leads
+      · ${num(send?.total_drafted)} drafted
+      · ${num(state.overview?.totals?.approved)} approved
+      · sending off
+    </span>
+  `;
+}
+
+function renderView() {
+  view.setAttribute("aria-busy", "false");
+  view.innerHTML = RENDERERS[state.section]();
+  renderRail();
+  bindViewEvents();
+}
+
+/* ------------------------------------------------------------------ events */
+
+function bindViewEvents() {
+  view.querySelectorAll("[data-filter]").forEach((control) => {
+    const key = control.dataset.filter;
+    const eventName = control.tagName === "SELECT" ? "change" : "input";
+    let timer = null;
+    control.addEventListener(eventName, (event) => {
+      const value = event.target.value;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(
+        async () => {
+          state.leadQuery[key] = value;
+          await loadLeads();
+          renderView();
+          const restored = view.querySelector(`[data-filter="${key}"]`);
+          if (restored) {
+            restored.focus({ preventScroll: true });
+            if (restored.setSelectionRange && restored.type === "search") {
+              const end = restored.value.length;
+              restored.setSelectionRange(end, end);
+            }
+          }
+        },
+        eventName === "input" ? 220 : 0,
+      );
+    });
+  });
+
+  view.querySelectorAll("[data-lead]").forEach((row) => {
+    const open = () => openLeadDrawer(row.dataset.lead);
+    row.addEventListener("click", (event) => {
+      if (event.target.closest("a, button, [data-stop], [data-verify]")) return;
+      open();
+    });
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        open();
+      }
+    });
+  });
+
+  view.querySelectorAll("[data-message]").forEach((node) => {
+    if (node.dataset.decide) return;
+    node.addEventListener("click", () => {
+      state.selectedMessage = node.dataset.message;
+      renderView();
+    });
+  });
+
+  view.querySelectorAll("[data-decide]").forEach((button) => {
+    button.addEventListener("click", () => decide(button, button.dataset.message, button.dataset.decide));
+  });
+
+  const runForm = view.querySelector("#run-form");
+  if (runForm) {
+    runForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const niche = runForm.querySelector("#run-niche").value.trim();
+      const regions = runForm
+        .querySelector("#run-regions")
+        .value.split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+      startRun(runForm.querySelector("#run-submit"), {
+        niche: niche || null,
+        regions,
+        resume: false,
+        until: "prospect",
+      });
+    });
+  }
+
+  const resumeButton = view.querySelector('[data-action="resume-run"]');
+  if (resumeButton) {
+    resumeButton.addEventListener("click", () => startRun(resumeButton, { resume: true }));
+  }
+}
+
+/** Serialises decision writes so a slow response can't overwrite a newer one. */
+let decisionChain = Promise.resolve();
+
+function currentStatusOf(messageId) {
+  const message = (state.messages?.messages || []).find((item) => item.id === messageId);
+  return message ? message.status : null;
+}
+
+async function applyDecision(messageId, status) {
+  await api(`/messages/${encodeURIComponent(messageId)}/decision`, {
+    method: "POST",
+    body: JSON.stringify({ status, run_id: state.messages?.run_id }),
+  });
+  await Promise.all([loadMessages(), loadOverview()]);
+  renderView();
+  return currentStatusOf(messageId);
+}
+
+function decide(button, messageId, status) {
+  // Status is read as a primitive before the write, so undo can't be confused by
+  // the message objects being replaced when the queue reloads.
+  const previousStatus = currentStatusOf(messageId) || "pending";
+  button.setAttribute("aria-busy", "true");
+
+  decisionChain = decisionChain
+    .then(async () => {
+      try {
+        const settled = await applyDecision(messageId, status);
+        if (status === "pending" || previousStatus === status) return;
+
+        toast(`${messageId} marked ${settled || status}.`, {
+          kind: status === "rejected" ? "critical" : "positive",
+          key: messageId,
+          undo: () => {
+            decisionChain = decisionChain
+              .then(async () => {
+                const reverted = await applyDecision(messageId, previousStatus);
+                if (reverted !== previousStatus) {
+                  toast(
+                    `Could not restore ${messageId} to ${previousStatus} — it is now ${reverted}.`,
+                    { kind: "critical" },
+                  );
+                }
+              })
+              .catch((error) => toast(`Undo failed: ${error.message}`, { kind: "critical" }));
+          },
+        });
+      } catch (error) {
+        button.removeAttribute("aria-busy");
+        toast(error.message, { kind: "critical" });
+      }
+    })
+    .catch((error) => toast(error.message, { kind: "critical" }));
+}
+
+async function verifyLead(button, leadId, status) {
+  button.setAttribute("aria-busy", "true");
+  try {
+    await api(`/leads/${encodeURIComponent(leadId)}/verify`, {
+      method: "POST",
+      body: JSON.stringify({ status }),
+    });
+    await Promise.all([loadLeads(), loadAllLeads(), loadOverview()]);
+    renderView();
+    toast(`${leadId} marked ${status}.`);
+  } catch (error) {
+    button.removeAttribute("aria-busy");
+    toast(error.message, { kind: "critical" });
+  }
+}
+
+async function continueQuiet(button) {
+  button.setAttribute("aria-busy", "true");
+  try {
+    const result = await api("/leads/continue", { method: "POST" });
+    await loadRuns();
+    renderView();
+    const names = (result.selected?.brand_names || []).join(", ") || "quiet leads";
+    toast(`Continuing ${names}. People, video, and drafts run only for these.`);
+    pollRun();
+  } catch (error) {
+    button.removeAttribute("aria-busy");
+    toast(error.message, { kind: "critical" });
+  }
+}
+
+async function startRun(button, payload) {
+  button.setAttribute("aria-busy", "true");
+  try {
+    await api("/runs", { method: "POST", body: JSON.stringify(payload) });
+    await loadRuns();
+    renderView();
+    toast("Pipeline run started. This view refreshes as it progresses.");
+    pollRun();
+  } catch (error) {
+    button.removeAttribute("aria-busy");
+    toast(error.message, { kind: "critical" });
+  }
+}
+
+let pollTimer = null;
+function pollRun() {
+  window.clearInterval(pollTimer);
+  pollTimer = window.setInterval(async () => {
+    await loadRuns();
+    if (!state.runs?.active?.active) {
+      window.clearInterval(pollTimer);
+      await Promise.all([
+        loadHealth(),
+        loadOverview(),
+        loadLeads(),
+        loadAllLeads(),
+        loadMarket(),
+        loadMessages(),
+      ]);
+      toast("Run finished. Data reloaded.");
+    }
+    renderView();
+  }, 4000);
+}
+
+/* ------------------------------------------------------------------ drawer */
+
+async function openLeadDrawer(leadId) {
+  const pool = [...(state.leads?.leads || []), ...(state.allLeads?.leads || [])];
+  const lead = pool.find((item) => item.id === leadId);
+  if (!lead) return;
+
+  const breakdown = lead.score_breakdown || {};
+  const ads = lead.ad_presence_summary || {};
+  const company = lead.company || {};
+  const contact = lead.contact;
+  const video = lead.video;
+  const hq = [company.city, company.state, company.country].filter(Boolean).join(", ");
+  const library = href(ads.library_url);
+  const site = href(lead.domain || company.website_url);
+  const linkedin = href(lead.linkedin_url || company.linkedin_url);
+  const facebook = href(lead.facebook_url || company.facebook_url);
+  const verify = (lead.verification || {}).status || "pending";
+
+  document.getElementById("drawer-tag").textContent = `${lead.region || "—"} · ${lead.industry || "—"}`;
+  document.getElementById("drawer-title").textContent = lead.brand_name;
+  document.getElementById("drawer-body").innerHTML = `
+    <section>
+      <div class="tag" style="display: block; margin-block-end: var(--space-sm)">Why it qualified</div>
+      <p>${esc(lead.qualification_reason || "No reason recorded.")}</p>
+    </section>
+
+    <section>
+      <div class="tag" style="display: block; margin-block-end: var(--space-sm)">
+        Score ${score(lead.qualification_score)} · rank ${score(lead.relative_rank_score)} in batch
+      </div>
+      <div class="stack--tight" style="display: flex; flex-direction: column">
+        ${gauge("Competitor presence", breakdown.competitor_presence)}
+        ${gauge("Brand maturity", breakdown.brand_maturity)}
+        ${gauge("Low ad presence", breakdown.low_ad_presence)}
+        ${gauge("Match confidence", breakdown.match_confidence, true)}
+      </div>
+    </section>
+
+    <section>
+      <div class="tag" style="display: block; margin-block-end: var(--space-sm)">Company</div>
+      <p style="margin-block-end: var(--space-sm)">${esc(company.short_description || lead.qualification_reason || "No description.")}</p>
+      <div class="factlist">
+        ${factRow("Website", site ? `<a href="${site}" target="_blank" rel="noreferrer noopener" style="color: var(--color-accent)">${esc(lead.domain || company.website_url)}</a>` : "—")}
+        ${factRow("LinkedIn", linkedin ? `<a href="${linkedin}" target="_blank" rel="noreferrer noopener" style="color: var(--color-accent)">profile</a>` : "—")}
+        ${factRow("Facebook", facebook ? `<a href="${facebook}" target="_blank" rel="noreferrer noopener" style="color: var(--color-accent)">page</a>` : "—")}
+        ${factRow("HQ", esc(hq || lead.region || "—"))}
+        ${factRow("Employees", num(lead.company_size || company.estimated_num_employees))}
+        ${factRow("Revenue", esc(company.annual_revenue_printed) || num(company.annual_revenue))}
+        ${factRow("Founded", esc(company.founded_year) || "—")}
+        ${factRow("API ads", num(ads.active_ads))}
+        ${factRow("UI ads", num((lead.verification || {}).ads_count_ui))}
+        ${factRow("Spend", ads.spend_reliable ? num(ads.estimated_spend) : "not reported by Meta")}
+      </div>
+    </section>
+
+    <section>
+      <div class="tag" style="display: block; margin-block-end: var(--space-sm)">Ad Library check</div>
+      <p class="lede" style="font-size: var(--text-sm); margin-block-end: var(--space-sm)">
+        The API said ${num(ads.active_ads)}. Open the Page view — not a keyword search — before spending Apollo people credits.
+      </p>
+      <div class="actions">
+        ${
+          library
+            ? `<a class="btn btn--primary" href="${library}" target="_blank" rel="noreferrer noopener">${icon("i-external", 15)} Open Ad Library</a>`
+            : `<span class="tag">no page id — cannot verify</span>`
+        }
+        <button class="btn btn--positive" type="button" data-verify="quiet" data-lead-id="${esc(lead.id)}" ${verify === "quiet" ? "disabled" : ""}>Quiet</button>
+        <button class="btn btn--critical" type="button" data-verify="has_ads" data-lead-id="${esc(lead.id)}" ${verify === "has_ads" ? "disabled" : ""}>Has ads</button>
+        <button class="btn btn--quiet" type="button" data-verify="skip" data-lead-id="${esc(lead.id)}" ${verify === "skip" ? "disabled" : ""}>Skip</button>
+      </div>
+    </section>
+
+    <section>
+      <div class="tag" style="display: block; margin-block-end: var(--space-sm)">Contact</div>
+      ${
+        contact
+          ? `<div class="factlist">
+              ${factRow("Name", esc(contact.name))}
+              ${factRow("Title", esc(contact.title))}
+              ${factRow("Email", esc(contact.email))}
+              ${factRow("LinkedIn", contact.linkedin ? `<a href="${esc(contact.linkedin)}" target="_blank" rel="noreferrer noopener" style="color: var(--color-accent)">profile</a>` : "—")}
+              ${factRow("Confidence", percent(contact.confidence))}
+              ${factRow("Source", esc(contact.source))}
+            </div>`
+          : `<p class="lede" style="font-size: var(--text-sm)">Contact enrichment found nobody for this brand. It stays in the lead list but cannot be pitched.</p>`
+      }
+    </section>
+
+    ${
+      video
+        ? `<section class="graphite">
+            <div class="graphite__head">
+              <span class="graphite__label">Sample video prompt</span>
+              <span class="graphite__label">${esc(when(video.generated_at))}</span>
+            </div>
+            <pre class="graphite__body">${esc(video.prompt)}</pre>
+            <div class="graphite__foot">${esc(video.url)}</div>
+          </section>`
+        : `<section>
+            <div class="tag" style="display: block; margin-block-end: var(--space-sm)">Sample video</div>
+            <p class="lede" style="font-size: var(--text-sm)">Not generated for this lead.</p>
+          </section>`
+    }
+  `;
+  drawer.showModal();
+}
+
+/* ---------------------------------------------------------------- palette */
+
+function paletteRows(query) {
+  const needle = query.trim().toLowerCase();
+  const rows = [];
+
+  SECTIONS.forEach((section) =>
+    rows.push({ kind: "section", label: section.label, action: () => navigate(section.id) }),
+  );
+
+  (state.allLeads?.leads || state.leads?.leads || []).forEach((lead) =>
+    rows.push({
+      kind: "lead",
+      label: `${lead.brand_name} — score ${score(lead.qualification_score)}`,
+      action: () => {
+        navigate("leads");
+        window.setTimeout(() => openLeadDrawer(lead.id), 60);
+      },
+    }),
+  );
+
+  (state.messages?.messages || []).forEach((message) =>
+    rows.push({
+      kind: `draft · ${message.status}`,
+      label: `${message.lead_id} — ${message.to_email}`,
+      action: () => {
+        state.selectedMessage = message.id;
+        navigate("approvals");
+      },
+    }),
+  );
+
+  return needle ? rows.filter((row) => row.label.toLowerCase().includes(needle)) : rows;
+}
+
+function renderPalette() {
+  const rows = state.paletteRows;
+  if (!rows.length) {
+    paletteList.innerHTML = `<div class="palette__row"><span class="palette__row-label">No matches</span></div>`;
+    return;
+  }
+  paletteList.innerHTML = rows
+    .map(
+      (row, index) => `
+        <div class="palette__row" role="option" aria-selected="${index === state.paletteIndex}" data-index="${index}">
+          <span class="palette__row-label">${esc(row.label)}</span>
+          <span class="palette__row-kind">${esc(row.kind)}</span>
+        </div>
+      `,
+    )
+    .join("");
+
+  paletteList.querySelectorAll("[data-index]").forEach((node) => {
+    node.addEventListener("click", () => {
+      state.paletteIndex = Number(node.dataset.index);
+      runPaletteSelection();
+    });
+  });
+
+  const active = paletteList.querySelector('[aria-selected="true"]');
+  if (active) active.scrollIntoView({ block: "nearest" });
+}
+
+function refreshPalette() {
+  state.paletteRows = paletteRows(paletteInput.value);
+  state.paletteIndex = 0;
+  renderPalette();
+}
+
+function runPaletteSelection() {
+  const row = state.paletteRows[state.paletteIndex];
+  palette.close();
+  if (row) row.action();
+}
+
+function openPalette() {
+  paletteInput.value = "";
+  refreshPalette();
+  palette.showModal();
+  paletteInput.focus({ preventScroll: true });
+}
+
+paletteInput.addEventListener("input", refreshPalette);
+
+palette.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    state.paletteIndex = Math.min(state.paletteIndex + 1, state.paletteRows.length - 1);
+    renderPalette();
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    state.paletteIndex = Math.max(state.paletteIndex - 1, 0);
+    renderPalette();
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    runPaletteSelection();
+  }
+});
+
+palette.addEventListener("click", (event) => {
+  if (event.target === palette) palette.close();
+});
+
+drawer.addEventListener("click", (event) => {
+  if (event.target === drawer) drawer.close();
+});
+
+document.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    if (palette.open) palette.close();
+    else openPalette();
+  }
+});
+
+document.addEventListener("click", (event) => {
+  const trigger = event.target.closest("[data-action]");
+  if (!trigger) return;
+  const action = trigger.dataset.action;
+
+  if (action === "open-palette") openPalette();
+
+  if (action === "toggle-rail") {
+    const sheet = document.getElementById("nav-sheet");
+    const open = sheet?.dataset.open !== "true";
+    setNavSheetOpen(open);
+  }
+
+  if (action === "close-drawer") drawer.close();
+
+  if (action === "continue-quiet") continueQuiet(trigger);
+});
+
+document.addEventListener("click", (event) => {
+  const verifyBtn = event.target.closest("[data-verify]");
+  if (!verifyBtn || !verifyBtn.dataset.leadId) return;
+  event.preventDefault();
+  event.stopPropagation();
+  verifyLead(verifyBtn, verifyBtn.dataset.leadId, verifyBtn.dataset.verify);
+});
+
+/* -------------------------------------------------------------------- data */
+
+async function loadHealth() {
+  try {
+    state.health = await api("/health");
+  } catch {
+    state.health = null;
+  }
+}
+
+async function loadConfig() {
+  try {
+    state.config = await api("/config");
+  } catch {
+    state.config = null;
+  }
+}
+
+async function loadOverview() {
+  try {
+    state.overview = await api("/overview");
+  } catch {
+    state.overview = null;
+  }
+}
+
+async function loadLeads() {
+  const q = state.leadQuery;
+  const params = new URLSearchParams({ sort: q.sort, order: q.order });
+  if (q.search) params.set("search", q.search);
+  if (q.region) params.set("region", q.region);
+  if (q.stage) params.set("stage", q.stage);
+  if (q.verification) params.set("verification", q.verification);
+  try {
+    state.leads = await api(`/leads?${params}`);
+  } catch {
+    state.leads = null;
+  }
+}
+
+async function loadAllLeads() {
+  try {
+    state.allLeads = await api("/leads?sort=score&order=desc");
+  } catch {
+    state.allLeads = null;
+  }
+}
+
+async function loadMarket() {
+  try {
+    state.market = await api("/market");
+  } catch {
+    state.market = null;
+  }
+}
+
+async function loadMessages() {
+  try {
+    state.messages = await api("/messages");
+  } catch {
+    state.messages = null;
+  }
+}
+
+async function loadRuns() {
+  try {
+    state.runs = await api("/runs");
+  } catch {
+    state.runs = null;
+  }
+}
+
+/* ------------------------------------------------------------------ router */
+
+function currentSection() {
+  const hash = window.location.hash.replace("#", "");
+  return SECTIONS.some((section) => section.id === hash) ? hash : "overview";
+}
+
+function navigate(sectionId) {
+  if (window.location.hash === `#${sectionId}`) {
+    state.section = sectionId;
+    renderView();
+    return;
+  }
+  window.location.hash = `#${sectionId}`;
+}
+
+function setNavSheetOpen(open) {
+  const sheet = document.getElementById("nav-sheet");
+  if (sheet) sheet.dataset.open = String(open);
+  const toggle = document.querySelector('[data-action="toggle-rail"]');
+  if (toggle) {
+    toggle.setAttribute("aria-expanded", String(open));
+    toggle.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+  }
+}
+
+window.addEventListener("hashchange", () => {
+  state.section = currentSection();
+  setNavSheetOpen(false);
+  renderView();
+  window.scrollTo({ top: 0 });
+});
+
+async function boot() {
+  state.section = currentSection();
+  await Promise.all([loadHealth(), loadConfig()]);
+  await Promise.all([
+    loadOverview(),
+    loadLeads(),
+    loadAllLeads(),
+    loadMarket(),
+    loadMessages(),
+    loadRuns(),
+  ]);
+  renderView();
+  if (state.runs?.active?.active) pollRun();
+}
+
+boot();
