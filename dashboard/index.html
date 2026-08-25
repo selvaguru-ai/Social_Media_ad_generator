@@ -15,8 +15,8 @@
       href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0&family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/assets/tokens.css?v=harvest-pages" />
-    <link rel="stylesheet" href="/assets/app.css?v=harvest-pages" />
+    <link rel="stylesheet" href="/assets/tokens.css?v=run-progress" />
+    <link rel="stylesheet" href="/assets/app.css?v=run-progress" />
   </head>
   <body>
     <!-- One icon set, one stroke voice: 24px grid, 1.6 stroke, round caps. -->
@@ -158,6 +158,13 @@
       </nav>
 
       <main class="main">
+        <div
+          id="run-progress"
+          class="run-progress"
+          hidden
+          role="status"
+          aria-live="polite"
+        ></div>
         <div class="view" id="view" aria-live="polite" aria-busy="true">
           <div class="stack">
             <div class="skeleton skeleton--half"></div>
@@ -201,6 +208,6 @@
 
     <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
-    <script src="/assets/app.js?v=harvest-pages" type="module"></script>
+    <script src="/assets/app.js?v=run-progress" type="module"></script>
   </body>
 </html>

@@ -151,9 +151,16 @@ class RunManager:
 
     def log_tail(self, lines: int = 200) -> Dict[str, Any]:
         if not self.log_path.exists():
-            return {"path": str(self.log_path), "lines": []}
+            return {"path": str(self.log_path), "lines": [], "modified_at": None}
         try:
             content = self.log_path.read_text(encoding="utf-8", errors="replace")
+            modified = datetime.fromtimestamp(
+                self.log_path.stat().st_mtime, tz=timezone.utc
+            ).isoformat()
         except OSError:
-            return {"path": str(self.log_path), "lines": []}
-        return {"path": str(self.log_path), "lines": content.splitlines()[-lines:]}
+            return {"path": str(self.log_path), "lines": [], "modified_at": None}
+        return {
+            "path": str(self.log_path),
+            "lines": content.splitlines()[-lines:],
+            "modified_at": modified,
+        }

@@ -327,6 +327,12 @@ def list_runs() -> Dict[str, Any]:
     return {"runs": store.run_index(), "active": runs.status()}
 
 
+@app.get("/api/runs/active/progress", tags=["runs"])
+def run_progress() -> Dict[str, Any]:
+    """Live stage + last log line so the UI can show running vs waiting."""
+    return store.live_progress(runs.status(), runs.log_tail(80))
+
+
 @app.post("/api/runs", tags=["runs"])
 def start_run(payload: RunRequest) -> Dict[str, Any]:
     try:

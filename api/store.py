@@ -106,6 +106,94 @@ def _iso(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
 
+_TOKEN_RE = re.compile(
+    r"(access_token=)[^&\s]+|(Bearer\s+)[A-Za-z0-9._\-]+|(X-Api-Key:\s*)\S+",
+    re.IGNORECASE,
+)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _redact_log_line(line: str) -> str:
+    cleaned = _ANSI_RE.sub("", str(line or ""))
+    cleaned = _TOKEN_RE.sub(lambda match: (match.group(1) or match.group(2) or match.group(3) or "") + "REDACTED", cleaned)
+    return cleaned.rstrip()
+
+
+def _collapse_log_lines(raw: List[str]) -> List[str]:
+    """Join Rich-wrapped continuation lines into single log events."""
+    out: List[str] = []
+    for raw_line in raw:
+        line = _redact_log_line(raw_line)
+        stripped = line.strip()
+        if not stripped:
+            continue
+        continuation = bool(out) and (
+            line[:1].isspace()
+            or (
+                not stripped.startswith("[")
+                and not stripped.startswith("===")
+                and not stripped.startswith("Stage ")
+                and not stripped.startswith("🚀")
+                and "INFO" not in stripped[:24]
+                and "ERROR" not in stripped[:24]
+                and "WARNING" not in stripped[:28]
+            )
+        )
+        if continuation:
+            out[-1] = re.sub(r"\s+", " ", f"{out[-1]} {stripped}").strip()
+        else:
+            out.append(re.sub(r"\s+", " ", stripped))
+    return out
+
+
+def _progress_detail(lines: List[str]) -> Optional[str]:
+    for line in reversed(lines):
+        if line.startswith("==="):
+            continue
+        # Drop the timestamp / level prefix when present.
+        detail = re.sub(
+            r"^\[\d{2}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}\]\s+(INFO|ERROR|WARNING)\s+",
+            "",
+            line,
+        )
+        detail = re.sub(r"^agent\.\w+\s+-\s+(INFO|ERROR|WARNING)\s+-\s+", "", detail)
+        if detail:
+            return detail[:240]
+    return None
+
+
+def _seconds_since(iso_value: Optional[str]) -> Optional[int]:
+    if not iso_value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(iso_value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return max(0, int((datetime.now(timezone.utc) - stamp).total_seconds()))
+
+
+def _current_stage(
+    pipeline_status: str,
+    completed: List[str],
+    process_active: bool,
+) -> Tuple[str, str]:
+    if pipeline_status == "awaiting_verification":
+        return "verify", "Waiting for verify"
+    if pipeline_status == "completed":
+        return "done", "Run finished"
+    done = set(completed)
+    for stage in STAGES:
+        if stage["key"] not in done:
+            if process_active or pipeline_status == "running":
+                return stage["key"], stage["label"]
+            return "idle", "Idle"
+    if process_active:
+        return "running", "Finishing"
+    return pipeline_status or "idle", (pipeline_status or "Idle").replace("_", " ").title()
+
+
 def _as_list(context: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
     value = context.get(key)
     if not isinstance(value, list):
@@ -689,3 +777,52 @@ class PipelineStore:
                 return {"path": str(candidate), "lines": tail}
 
         return {"path": None, "lines": []}
+
+    def live_progress(self, run_status: Dict[str, Any], log: Dict[str, Any]) -> Dict[str, Any]:
+        """Stage, counts, and last log line for the live child process."""
+        context = self.state() or {}
+        completed = list(context.get("completed_stages") or [])
+        process_active = bool(run_status.get("active"))
+        pipeline_status = context.get("status") or ("running" if process_active else "idle")
+        active = process_active or pipeline_status == "running"
+
+        stage_key, stage_label = _current_stage(pipeline_status, completed, active)
+        lines = _collapse_log_lines(log.get("lines") or [])
+        for index, line in enumerate(lines):
+            if line.startswith("=== run started"):
+                lines = lines[index:]
+        detail = _progress_detail(lines) or stage_label
+        quiet_seconds = _seconds_since(log.get("modified_at"))
+        advertisers = len(_as_list(context, "dominant_advertisers"))
+        leads = len(self.merge_leads(context)) if context else 0
+
+        headline = stage_label
+        if pipeline_status == "awaiting_verification":
+            headline = "Paused — mark Quiet leads, then Continue"
+        elif pipeline_status == "completed" and context.get("error"):
+            headline = str(context.get("error"))
+        elif active and advertisers:
+            headline = f"{stage_label} · {advertisers} advertisers"
+        elif active and context.get("niche"):
+            headline = f"{stage_label} · {context.get('niche')}"
+
+        return {
+            "active": active,
+            "pipeline_status": pipeline_status,
+            "stage_key": stage_key,
+            "stage_label": stage_label,
+            "headline": headline,
+            "detail": detail,
+            "quiet_seconds": quiet_seconds,
+            "niche": context.get("niche"),
+            "regions": context.get("regions") or [],
+            "completed_stages": completed,
+            "advertisers": advertisers,
+            "ads": len(_as_list(context, "active_ads")),
+            "leads": leads,
+            "brands_analyzed": context.get("total_brands_analyzed"),
+            "error": context.get("error"),
+            "run": run_status.get("run"),
+            "log_lines": lines[-12:],
+            "log_modified_at": log.get("modified_at"),
+        }

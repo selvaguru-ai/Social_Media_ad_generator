@@ -25,6 +25,7 @@ const state = {
   market: null,
   messages: null,
   runs: null,
+  progress: null,
   leadQuery: { search: "", region: "", stage: "", sort: "score", order: "desc", verification: "" },
   selectedMessage: null,
   paletteIndex: 0,
@@ -37,6 +38,7 @@ const view = document.getElementById("view");
 const railNav = document.getElementById("rail-nav");
 const sheetNav = document.getElementById("sheet-nav");
 const statusline = document.getElementById("statusline");
+const runProgress = document.getElementById("run-progress");
 const toasts = document.getElementById("toasts");
 const palette = document.getElementById("palette");
 const paletteInput = document.getElementById("palette-input");
@@ -619,8 +621,10 @@ function renderLeads() {
             </div>`
           : `<div class="panel__body">${emptyState(
               "No leads to verify",
-              "Start a run from the Runs page. It pauses after Prospect so you can check Ad Library pages before people search spends Apollo credits.",
-              'python run_pipeline.py "sports shoes" --regions US',
+              state.progress?.active
+                ? state.progress.detail || "Prospect is still checking Apollo brands. This page updates as Page IDs resolve."
+                : "Start a run from the Runs page. It pauses after Prospect so you can check Ad Library pages before people search spends Apollo credits.",
+              state.progress?.active ? "" : 'python run_pipeline.py "sports shoes" --regions US',
             )}</div>`
       }
     </section>
@@ -629,9 +633,16 @@ function renderLeads() {
 
 function renderMarket() {
   const data = state.market;
-  if (!data) return emptyState("No market data", "Run the pipeline to populate the ad-discovery stage.", 'python run_pipeline.py "sustainable fashion"');
+  const running = Boolean(state.progress?.active);
+  if (!data && !running) {
+    return emptyState(
+      "No market data",
+      "Run the pipeline to populate the ad-discovery stage.",
+      'python run_pipeline.py "sustainable fashion"',
+    );
+  }
 
-  const advertisers = (data.advertisers || [])
+  const advertisers = (data?.advertisers || [])
     .map((item) => {
       const library = href(item.library_url);
       const pageId = item.page_id ? `<code>${esc(item.page_id)}</code>` : "—";
@@ -653,8 +664,8 @@ function renderMarket() {
     })
     .join("");
 
-  const maxRegion = Math.max(1, ...Object.values(data.ads_per_region || {}));
-  const regions = Object.entries(data.ads_per_region || {})
+  const maxRegion = Math.max(1, ...Object.values(data?.ads_per_region || {}));
+  const regions = Object.entries(data?.ads_per_region || {})
     .sort((a, b) => b[1] - a[1])
     .map(
       ([region, count]) => `
@@ -669,22 +680,22 @@ function renderMarket() {
     )
     .join("");
 
-  const hooks = (data.patterns?.common_hooks || [])
+  const hooks = (data?.patterns?.common_hooks || [])
     .map((hook) => `<span class="chip chip--accent">${esc(hook)}</span>`)
     .join(" ");
 
-  const copy = (data.patterns?.sample_copy || []).map((line) => esc(line)).join("\n");
+  const copy = (data?.patterns?.sample_copy || []).map((line) => esc(line)).join("\n");
 
   return `
     <div class="page-head enter">
       <span class="eyebrow">02 · ad discovery</span>
       <h1>who is already&nbsp;<em class="verb">running</em> ads.</h1>
       <p class="lede">
-        who is already advertising in ${esc(data.niche || "this niche")}. this is the intel the pitch
+        who is already advertising in ${esc(data?.niche || state.progress?.niche || "this niche")}. this is the intel the pitch
         leans on — a lead is worth contacting because these brands are spending and they are not.
       </p>
       ${
-        (data.search_terms || []).length
+        (data?.search_terms || []).length
           ? `<p class="lede" style="font-size: var(--text-sm)">search terms: ${(data.search_terms || [])
               .map((term) => `<span class="chip">${esc(term)}</span>`)
               .join(" ")}</p>`
@@ -698,7 +709,7 @@ function renderMarket() {
       <section class="panel panel--flush">
         <div class="panel__head">
           <h2 style="font-size: var(--text-md)">Dominant advertisers</h2>
-          <span class="tag">${num((data.advertisers || []).length)} tracked</span>
+          <span class="tag">${num((data?.advertisers || []).length)} tracked</span>
         </div>
         ${
           advertisers
@@ -718,8 +729,10 @@ function renderMarket() {
                 </table>
               </div>`
             : `<div class="panel__body">${emptyState(
-                "No advertisers recorded",
-                "Ad Discovery harvests unique Meta pages from keyword variants. If this is empty, Meta returned no ads_archive hits for those terms.",
+                running ? "Harvesting advertisers" : "No advertisers recorded",
+                running
+                  ? state.progress?.detail || "Ad Discovery is querying Meta. This table fills as unique pages arrive."
+                  : "Ad Discovery harvests unique Meta pages from keyword variants. If this is empty, Meta returned no ads_archive hits for those terms.",
               )}</div>`
         }
       </section>
@@ -743,7 +756,7 @@ function renderMarket() {
             ? `<section class="graphite">
                 <div class="graphite__head">
                   <span class="graphite__label">Sample competitor copy</span>
-                  <span class="graphite__label">${num((data.patterns?.sample_copy || []).length)} lines</span>
+                  <span class="graphite__label">${num((data?.patterns?.sample_copy || []).length)} lines</span>
                 </div>
                 <pre class="graphite__body">${copy}</pre>
               </section>`
@@ -937,7 +950,7 @@ function renderRuns() {
 
     ${
       isActive
-        ? `<div class="banner">${icon("i-play", 18)}<div class="banner__body"><strong>Run in progress</strong> (pid ${esc(active.pid)}) since ${esc(when(active.started_at))}. ${esc((active.command || []).join(" "))}</div></div>`
+        ? `<div class="banner">${icon("i-play", 18)}<div class="banner__body"><strong>${esc(state.progress?.headline || "Run in progress")}</strong> ${esc(state.progress?.detail || "")}</div></div>`
         : active
           ? `<div class="banner${active.state === "failed" ? " banner--critical" : ""}">${icon(active.state === "failed" ? "i-alert" : "i-check", 18)}<div class="banner__body"><strong>Last launched run ${esc(active.state)}</strong> — exit code ${esc(active.exit_code ?? "—")}, finished ${esc(when(active.finished_at))}.</div></div>`
           : ""
@@ -975,6 +988,8 @@ function renderRuns() {
       </form>
     </section>
 
+    ${renderRunLogPanel()}
+
     <section class="panel panel--flush">
       <div class="panel__head">
         <h2 style="font-size: var(--text-md)">History</h2>
@@ -1004,6 +1019,24 @@ function renderRuns() {
               'python run_pipeline.py "sustainable fashion" --regions US,GB,CA',
             )}</div>`
       }
+    </section>
+  `;
+}
+
+function renderRunLogPanel() {
+  const lines = state.progress?.log_lines || [];
+  const body = lines.length
+    ? lines.map((line) => esc(line)).join("\n")
+    : state.progress?.active
+      ? "Waiting for the first log line…"
+      : "Start a run to stream the pipeline log here.";
+  return `
+    <section class="panel">
+      <div class="panel__head">
+        <h2 style="font-size: var(--text-md)">Live log</h2>
+        <span class="tag">${state.progress?.active ? "streaming" : "idle"}</span>
+      </div>
+      <pre class="run-log" id="run-log">${body}</pre>
     </section>
   `;
 }
@@ -1050,14 +1083,59 @@ function renderRail() {
   if (sheetNav) sheetNav.innerHTML = links;
 
   const send = state.overview?.summaries?.send;
+  const progress = state.progress;
+  const running = Boolean(progress?.active);
   statusline.innerHTML = `
-    <span>the market is already spending. these brands are not.</span>
+    <span>${
+      running
+        ? esc(progress.headline || "Run in progress")
+        : "the market is already spending. these brands are not."
+    }</span>
     <span class="mono">
       ${esc(state.overview?.run_id || "—")}
-      · ${num(state.overview?.totals?.leads)} leads
+      · ${num(progress?.advertisers ?? state.overview?.totals?.advertisers)} advertisers
+      · ${num(progress?.leads ?? state.overview?.totals?.leads)} leads
       · ${num(send?.total_drafted)} drafted
-      · ${num(state.overview?.totals?.approved)} approved
-      · sending off
+      · ${running ? `log ${formatQuiet(progress?.quiet_seconds)}` : "sending off"}
+    </span>
+  `;
+}
+
+function formatQuiet(seconds) {
+  if (seconds === null || seconds === undefined) return "waiting";
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s ago`;
+}
+
+function renderProgress() {
+  if (!runProgress) return;
+  const progress = state.progress;
+  const show =
+    Boolean(progress?.active) ||
+    progress?.pipeline_status === "awaiting_verification" ||
+    progress?.pipeline_status === "running";
+  if (!show) {
+    runProgress.hidden = true;
+    runProgress.innerHTML = "";
+    return;
+  }
+  const quiet = (progress.quiet_seconds || 0) >= 90;
+  const paused = progress.pipeline_status === "awaiting_verification";
+  runProgress.hidden = false;
+  runProgress.dataset.quiet = String(quiet && progress.active);
+  runProgress.dataset.done = String(paused);
+  runProgress.innerHTML = `
+    <span class="run-progress__pulse" aria-hidden="true"></span>
+    <div class="run-progress__copy">
+      <span class="run-progress__headline">${esc(progress.headline || progress.stage_label || "Run in progress")}</span>
+      <span class="run-progress__detail">${esc(progress.detail || "")}</span>
+    </div>
+    <span class="run-progress__meta">
+      ${esc(progress.stage_label || "")}
+      · ${num(progress.advertisers)} pages
+      · ${num(progress.leads)} leads
+      · ${paused ? "your turn" : `log ${formatQuiet(progress.quiet_seconds)}`}
     </span>
   `;
 }
@@ -1066,6 +1144,7 @@ function renderView() {
   view.setAttribute("aria-busy", "false");
   view.innerHTML = RENDERERS[state.section]();
   renderRail();
+  renderProgress();
   bindViewEvents();
 }
 
@@ -1250,12 +1329,35 @@ async function startRun(button, payload) {
 }
 
 let pollTimer = null;
-function pollRun() {
-  window.clearInterval(pollTimer);
-  pollTimer = window.setInterval(async () => {
-    await loadRuns();
-    if (!state.runs?.active?.active) {
-      window.clearInterval(pollTimer);
+let pollBusy = false;
+let lastViewKey = "";
+let announcedFinish = false;
+
+function viewDataKey() {
+  return JSON.stringify({
+    section: state.section,
+    advertisers: state.market?.advertisers?.length || 0,
+    niche: state.market?.niche || state.overview?.niche || "",
+    leads: state.leads?.count || 0,
+    status: state.overview?.status || "",
+    active: Boolean(state.runs?.active?.active),
+    stage: state.progress?.stage_key || "",
+  });
+}
+
+async function tickRun() {
+  if (pollBusy) return;
+  pollBusy = true;
+  const wasActive =
+    Boolean(state.runs?.active?.active) || state.progress?.pipeline_status === "running";
+  try {
+    await Promise.all([loadRuns(), loadProgress()]);
+    const isActive = Boolean(state.runs?.active?.active) || state.progress?.pipeline_status === "running";
+    if (isActive) {
+      announcedFinish = false;
+      await Promise.all([loadOverview(), loadLeads(), loadAllLeads(), loadMarket()]);
+    } else if (wasActive && !announcedFinish) {
+      announcedFinish = true;
       await Promise.all([
         loadHealth(),
         loadOverview(),
@@ -1264,10 +1366,44 @@ function pollRun() {
         loadMarket(),
         loadMessages(),
       ]);
-      toast("Run finished. Data reloaded.");
+      toast("Run finished. Market and leads reloaded.");
+      window.clearInterval(pollTimer);
+      pollTimer = null;
+    } else if (!isActive) {
+      window.clearInterval(pollTimer);
+      pollTimer = null;
     }
-    renderView();
-  }, 4000);
+
+    renderProgress();
+    renderRail();
+    const logEl = document.getElementById("run-log");
+    if (logEl && state.section === "runs") {
+      const lines = state.progress?.log_lines || [];
+      logEl.textContent = lines.length ? lines.join("\n") : logEl.textContent;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    const skipView =
+      (drawer?.open && state.section === "leads") ||
+      palette?.open ||
+      (state.section === "runs" && document.activeElement && view.contains(document.activeElement));
+
+    const nextKey = viewDataKey();
+    if (!skipView && nextKey !== lastViewKey) {
+      lastViewKey = nextKey;
+      renderView();
+    }
+  } finally {
+    pollBusy = false;
+  }
+}
+
+function pollRun() {
+  window.clearInterval(pollTimer);
+  announcedFinish = false;
+  lastViewKey = "";
+  tickRun();
+  pollTimer = window.setInterval(tickRun, 3000);
 }
 
 /* ------------------------------------------------------------------ drawer */
@@ -1591,6 +1727,14 @@ async function loadRuns() {
   }
 }
 
+async function loadProgress() {
+  try {
+    state.progress = await api("/runs/active/progress");
+  } catch {
+    state.progress = null;
+  }
+}
+
 /* ------------------------------------------------------------------ router */
 
 function currentSection() {
@@ -1620,6 +1764,7 @@ function setNavSheetOpen(open) {
 window.addEventListener("hashchange", () => {
   state.section = currentSection();
   setNavSheetOpen(false);
+  lastViewKey = "";
   renderView();
   window.scrollTo({ top: 0 });
 });
@@ -1634,9 +1779,10 @@ async function boot() {
     loadMarket(),
     loadMessages(),
     loadRuns(),
+    loadProgress(),
   ]);
   renderView();
-  if (state.runs?.active?.active) pollRun();
+  if (state.runs?.active?.active || state.progress?.active) pollRun();
 }
 
 boot();

@@ -335,6 +335,99 @@ kbd {
   padding: var(--space-lg) var(--page-gutter) var(--space-2xl);
 }
 
+.run-progress {
+  align-items: flex-start;
+  background: var(--color-paper-2);
+  border-block-end: var(--rule-hairline) solid var(--color-rule);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm) var(--space-md);
+  padding: var(--space-sm) var(--page-gutter);
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+}
+
+.run-progress[hidden] {
+  display: none;
+}
+
+.run-progress__pulse {
+  animation: run-pulse 1.4s var(--ease-out) infinite;
+  background: var(--color-accent);
+  border-radius: 999px;
+  flex: none;
+  height: 0.55rem;
+  margin-block-start: 0.45rem;
+  width: 0.55rem;
+}
+
+.run-progress[data-quiet="true"] .run-progress__pulse {
+  animation: none;
+  background: var(--color-caution);
+}
+
+.run-progress[data-done="true"] .run-progress__pulse {
+  animation: none;
+  background: var(--color-positive);
+}
+
+@keyframes run-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.7);
+  }
+}
+
+.run-progress__copy {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 12rem;
+}
+
+.run-progress__headline {
+  color: var(--color-ink);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.run-progress__detail {
+  color: var(--color-muted);
+  font-family: var(--font-mono, var(--font-body));
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-micro);
+  overflow-wrap: anywhere;
+}
+
+.run-progress__meta {
+  color: var(--color-muted);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-micro);
+  margin-left: auto;
+  text-transform: uppercase;
+}
+
+.run-log {
+  background: var(--color-paper-3);
+  border-radius: var(--radius-md);
+  color: var(--color-neutral);
+  font-family: var(--font-mono, var(--font-body));
+  font-size: var(--text-xs);
+  line-height: 1.55;
+  margin: 0;
+  max-height: 16rem;
+  overflow: auto;
+  padding: var(--space-sm) var(--space-md);
+  white-space: pre-wrap;
+}
+
 /* Ft5 statement close */
 .statusline {
   align-items: baseline;
